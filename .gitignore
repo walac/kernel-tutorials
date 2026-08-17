@@ -1,0 +1,79 @@
+*.pdf
+*.odt
+!reference.odt
+*.html
+.semcode.db
+
+# --- AI / LLM tool config, state, and instructions files ---
+# This is a personal, local-only repo, so all assistant tooling artifacts
+# (including hand-authored instructions files) are treated as local noise,
+# not project content.
+
+# Claude Code
+.claude/
+.clauderc
+CLAUDE.*
+CLAUDE.local.*
+.mcp.json
+
+# Generic "agent instructions" file used by several tools (OpenAI Codex,
+# Cursor's agent mode, Zed, Amp, etc.)
+AGENTS.*
+
+# Google Gemini (CLI / Code Assist)
+.gemini/
+GEMINI.*
+
+# Cursor
+.cursor/
+.cursorrules
+.cursorignore
+.cursorindexingignore
+
+# Windsurf / Codeium
+.windsurf/
+.windsurfrules
+.codeium/
+.codeiumignore
+
+# GitHub Copilot
+.copilot/
+.github/copilot-instructions.md
+
+# Continue.dev
+.continue/
+
+# Aider
+.aider*
+
+# Sourcegraph Cody
+.cody/
+
+# Cline / Roo Code (VS Code agent extensions)
+.clinerules
+.clineignore
+.roo/
+.roorules
+
+# Amazon Q Developer / CodeWhisperer
+.amazonq/
+
+# OpenAI Codex CLI
+.codex/
+
+# Qodo (formerly CodiumAI)
+.qodo/
+
+# Tabnine
+.tabnine/
+
+# JetBrains AI Assistant / Junie
+.junie/
+
+# Zed AI
+.zed/
+
+# Misc AI scaffolding tools
+.devin/
+.bolt/
+.v0/

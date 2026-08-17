@@ -1,0 +1,28 @@
+\usepackage{microtype}
+\usepackage{fancyvrb}
+\usepackage{framed}
+\usepackage{etoolbox}
+\usepackage[htt]{hyphenat}
+
+% Allow LaTeX to stretch interword spacing to avoid margin overflow
+\sloppy
+
+% Prevent line breaks inside inline \texttt{} spans — hyphenat's [htt]
+% stops algorithmic hyphenation, but LaTeX still breaks at underscores;
+% \mbox suppresses all breaks.
+\let\originaltexttt\texttt
+\renewcommand{\texttt}[1]{\mbox{\originaltexttt{#1}}}
+
+% Code blocks: light grey background
+\DefineVerbatimEnvironment{Highlighting}{Verbatim}{fontsize=\small,commandchars=\\\{\}}
+\fvset{fontsize=\small}
+\definecolor{shadecolor}{RGB}{245,245,245}
+\renewenvironment{Shaded}{\begin{snugshade}}{\end{snugshade}}
+
+% Keep untagged fenced blocks (plain ``` ASCII diagrams, rendered as
+% `verbatim`) from splitting across a page break. Wrapping in a minipage
+% makes LaTeX treat the whole block as one unbreakable unit, pushing it to
+% the next page instead of tearing it mid-diagram. Language-tagged blocks
+% (```c, rendered as `Shaded`) are left alone — they may still break.
+\BeforeBeginEnvironment{verbatim}{\begin{minipage}{\linewidth}}
+\AfterEndEnvironment{verbatim}{\end{minipage}}
