@@ -369,15 +369,15 @@ virtual addresses with two different permissions:
 ```
                           physical page (the actual RAM
                           holding the instruction bytes)
-                                     ^        ^
-                                     |        |
+                                    ^        ^
+                                    |        |
               normal kernel         |        |   text_poke_mm_addr
               mapping (all CPUs,    |        |   (this CPU only,
               always present)       |        |    exists briefly)
                      |               \      /            |
                      v                \    /             v
           .text  [ RO, executable ]    \  /    [ RW, not executable ]
-          (every CPU's %cr3 maps               (only this CPU's %cr3
+          (every CPU's %cr3 maps        \/     (only this CPU's %cr3
            this address, forever)                maps this address,
                                                   only while patching)
 ```
