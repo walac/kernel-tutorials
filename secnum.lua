@@ -16,6 +16,7 @@ local sec_numbers = {}   -- identifier -> "9.1"
 
 local level2 = -1
 local level3 = 0
+local level4 = 0
 
 local AssignNumbers = {
   Header = function(el)
@@ -23,10 +24,15 @@ local AssignNumbers = {
     if el.level == 2 then
       level2 = level2 + 1
       level3 = 0
+      level4 = 0
       num = tostring(level2)
     elseif el.level == 3 then
       level3 = level3 + 1
+      level4 = 0
       num = string.format("%d.%d", level2, level3)
+    elseif el.level == 4 then
+      level4 = level4 + 1
+      num = string.format("%d.%d.%d", level2, level3, level4)
     else
       return nil
     end
