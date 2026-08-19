@@ -2,7 +2,7 @@
 --
 -- Headings in the source carry no number (e.g. "## Hardware background
 -- {#hardware-background-why-this-is-hard}"). This filter:
---   1. computes "0", "9.1", etc. from heading nesting (level 2 = major,
+--   1. computes "1", "9.1", etc. from heading nesting (level 2 = major,
 --      level 3 = minor) and prepends it to the heading's rendered text
 --   2. resolves every `[](#id){.secref}` link left by convert_secrefs.py
 --      into a real, clickable link reading "§<live number>"
@@ -14,7 +14,7 @@
 
 local sec_numbers = {}   -- identifier -> "9.1"
 
-local level2 = -1
+local level2 = 0
 local level3 = 0
 local level4 = 0
 
