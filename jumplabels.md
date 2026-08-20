@@ -1240,7 +1240,7 @@ jmp %l[l_yes]
   mechanical detail worth flagging here is the pair
   `.pushsection __jump_table, "aw"` / `.popsection` inside it, which
   temporarily redirects everything the assembler emits into a different ELF
-  section ([`__jump_table`](https://elixir.bootlin.com/linux/v7.2-rc7/source/scrips/module.lds.S#L31), instead of `.text`) for just the handful of
+  section ([`__jump_table`](https://elixir.bootlin.com/linux/v7.2-rc7/source/scripts/module.lds.S#L31), instead of `.text`) for just the handful of
   directives in between, then restores the previous section afterward. That
   is how the inline assembly of one function ends up contributing bytes to
   two entirely separate sections of the final binary, without needing two
