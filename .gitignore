@@ -2,6 +2,7 @@
 *.odt
 !reference.odt
 *.html
+*.jkl.md
 .semcode.db
 
 # --- AI / LLM tool config, state, and instructions files ---

@@ -55,6 +55,10 @@ local ResolveSecrefs = {
       num = "?"
     end
     el.content = {pandoc.Str("§" .. num)}
+    -- Drop the marker class now that it's served its purpose: markdown/gfm
+    -- writers render an unhandled class as literal "{.secref}" text, since
+    -- kramdown's attribute-list syntax needs a leading colon pandoc doesn't emit.
+    el.classes = pandoc.List({})
     return el
   end
 }

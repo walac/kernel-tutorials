@@ -3,7 +3,7 @@ PDF  := $(patsubst %.md,%.pdf,$(SRC))
 ODT  := $(patsubst %.md,%.odt,$(SRC))
 HTML := $(patsubst %.md,%.html,$(SRC))
 TXT  := $(patsubst %.md,%.txt,$(SRC))
-JEKYLL := $(patsubst %.md,%.jekyll.html,$(SRC))
+JEKYLL := $(patsubst %.md,%.jkl.md,$(SRC))
 
 FILTERS	 := $(wildcard *.lua)
 TEX_DEPS := $(wildcard *.tex)
@@ -58,30 +58,28 @@ POST_DATE ?= $(shell date +%Y-%m-%d)
 		--lua-filter=break-code.lua \
 		--to=plain
 
-%.jekyll.html: %.md $(FILTERS) jekyll.html
+%.jkl.md: %.md $(FILTERS)
 	{ printf '%s\n' '---' \
 		"title: \"$$(sed -n '1s/^# *//p' $<)\"" \
 		'comments: true' \
 		'categories: [kernel]' \
-		'---' ''; \
+		'---' '' '* TOC' '{:toc}' ''; \
 	  sed '1d' $< | pandoc \
-		--template=jekyll.html \
-		--toc --toc-depth=3 \
-		--highlight-style=breezedark \
 		--lua-filter=secnum.lua \
-		--lua-filter=break-code.lua; \
+		-t gfm+attributes; \
 	} > $@
 
-jekyll: $(JEKYLL)
-	$(foreach f,$(JEKYLL),install -m 644 $(f) $(BLOG_DIR)/_posts/$(POST_DATE)-$(basename $(basename $(f))).html;)
+install: $(JEKYLL)
+	$(foreach f,$(JEKYLL),install -m 644 $(f) $(BLOG_DIR)/_posts/$(POST_DATE)-$(basename $(basename $(f))).md;)
 
 all: pdf odt html txt
 pdf: $(PDF) $(FILTERS) $(TEX_DEPS)
 odt: $(ODT) $(FILTERS) reference.odt
 html: $(HTML) $(FILTERS) style.css
 txt: $(TXT) $(FILTERS)
+jekyll: $(JEKYLL) $(FILTERS)
 
 clean:
 	rm -f $(PDF) $(ODT) $(HTML) $(TXT) $(JEKYLL)
 
-.PHONY: all pdf odt html txt jekyll clean
+.PHONY: all pdf odt html txt jekyll install clean
