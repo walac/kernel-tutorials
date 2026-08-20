@@ -34,9 +34,10 @@ make clean  # removes all generated PDF/ODT/HTML output
   used by the HTML build requires at least 2.19.
 - **A LaTeX distribution with XeLaTeX** — used as Pandoc's PDF engine, for
   proper system-font and Unicode support.
-- **Fonts**: DejaVu Serif, DejaVu Sans, and Source Code Pro (referenced by
-  name in the `Makefile`'s `-V mainfont=`/`sansfont=`/`monofont=` and in
-  `reference.odt`/`style.css`).
+- **Fonts**: DejaVu Serif and Source Code Pro (referenced by name in the
+  `Makefile`'s `-V mainfont=`/`monofont=`, in `reference.odt`, and in
+  `style.css`), plus DejaVu Sans (referenced only in the `Makefile`'s PDF
+  build via `-V sansfont=` — the ODT and HTML builds don't use it).
 - **GNU Make**.
 
 ### Installing on Fedora
