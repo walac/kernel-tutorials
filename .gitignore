@@ -1,5 +1,6 @@
 *.pdf
 *.odt
+*.txt
 !reference.odt
 *.html
 *.jkl.md

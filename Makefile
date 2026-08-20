@@ -11,8 +11,11 @@ TEX_DEPS := $(wildcard *.tex)
 BLOG_DIR  ?= $(HOME)/work/walac.github.io
 POST_DATE ?= $(shell date +%Y-%m-%d)
 
+AUTHOR := Wander Lairson Costa
+TITLE   = $$(sed -n '1s/^\# *//p' $<)
+
 %.pdf: %.md $(FILTERS) $(TEX_DEPS)
-	pandoc $< -o $@ \
+	sed '1d' $< | pandoc -o $@ \
 		--top-level-division=part \
 		--pdf-engine=xelatex \
 		--toc --toc-depth=3 \
@@ -30,18 +33,22 @@ POST_DATE ?= $(shell date +%Y-%m-%d)
 		-V colorlinks=true \
 		-V linkcolor=NavyBlue \
 		-V urlcolor=NavyBlue \
-		-V citecolor=NavyBlue
+		-V citecolor=NavyBlue \
+		--metadata title="$(TITLE)" \
+		--metadata author="$(AUTHOR)"
 
 %.odt: %.md $(FILTERS) reference.odt
-	pandoc $< -o $@ \
+	sed '1d' $< | pandoc -o $@ \
 		--toc --toc-depth=3 \
 		--highlight-style=tango \
 		--lua-filter=secnum.lua \
 		--lua-filter=break-code.lua \
-		--reference-doc=reference.odt
+		--reference-doc=reference.odt \
+		--metadata title="$(TITLE)" \
+		--metadata author="$(AUTHOR)"
 
 %.html: %.md $(FILTERS) style.css
-	pandoc $< -o $@ \
+	sed '1d' $< | pandoc -o $@ \
 		--standalone \
 		--embed-resources \
 		--toc --toc-depth=3 \
@@ -49,18 +56,21 @@ POST_DATE ?= $(shell date +%Y-%m-%d)
 		--lua-filter=secnum.lua \
 		--lua-filter=break-code.lua \
 		--css=style.css \
-		--metadata title="$(basename $(notdir $<))"
+		--metadata title="$(TITLE)" \
+		--metadata author="$(AUTHOR)"
 
 %.txt: %.md $(FILTERS)
-	pandoc $< -o $@ \
+	{ printf '%s\n\n%s\n\n' "$(TITLE)" "$(AUTHOR)"; \
+	  sed '1d' $< | pandoc \
 		--toc --toc-depth=3 \
 		--lua-filter=secnum.lua \
 		--lua-filter=break-code.lua \
-		--to=plain
+		--to=plain; \
+	} > $@
 
 %.jkl.md: %.md $(FILTERS)
 	{ printf '%s\n' '---' \
-		"title: \"$$(sed -n '1s/^# *//p' $<)\"" \
+		"title: \"$(TITLE)\"" \
 		'comments: true' \
 		'categories: [kernel]' \
 		'---' '' '* TOC' '{:toc}' ''; \
@@ -83,3 +93,4 @@ clean:
 	rm -f $(PDF) $(ODT) $(HTML) $(TXT) $(JEKYLL)
 
 .PHONY: all pdf odt html txt jekyll install clean
+.DELETE_ON_ERROR:
