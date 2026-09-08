@@ -36,6 +36,41 @@ underneath it.
 
 ---
 
+## The problem jump labels solve {#the-problem-jump-labels-solve}
+
+Kernel code is full of rarely-taken checks that guard optional
+functionality: "is tracing enabled for this tracepoint?", "is this security
+module active?", "is this debug feature on?". A naive implementation:
+
+```c
+if (some_feature_enabled)
+        do_something();
+```
+
+Even when `some_feature_enabled` is almost always false, the CPU still must:
+
+1. Load `some_feature_enabled` from memory (a cache line).
+2. Compare it against zero.
+3. Predict/branch on the result.
+
+As [](#what-a-cpu-actually-does-with-instructions){.secref} worked out in detail, modern CPUs predict step 3 well, but
+"well" is not "free": prediction hides the misprediction penalty, not the
+**guaranteed memory load** in step 1. When the check sits in a hot path that
+runs millions of times a second (scheduler, networking, every `trace_*()`
+site), that unavoidable load adds up.
+
+**Jump labels remove the load and the compare for the common case** by
+rewriting the machine code at runtime. When the feature is off, the hot path
+literally has no branch to the rare code — it is a `nop` (or an unconditional
+`jmp` over an out-of-line block, depending on polarity). When someone turns
+the feature on, the kernel walks every call site for that key and overwrites
+`nop`↔`jmp` in place.
+
+Tradeoff in one sentence: **toggling is expensive** (machine-wide sync,
+text poke); **running the hot path is nearly free**.
+
+---
+
 ## Hardware background (why this is hard) {#hardware-background-why-this-is-hard}
 
 Jump labels work by rewriting machine code while the kernel is running -
@@ -458,41 +493,6 @@ temporary mappings.
 > they compile to the same `rep movsb`/`rep stosb` sequence the real
 > functions would use, but leave no `call` for objtool to flag, because
 > there is no separate function left to call.
-
----
-
-## The problem jump labels solve {#the-problem-jump-labels-solve}
-
-Kernel code is full of rarely-taken checks that guard optional
-functionality: "is tracing enabled for this tracepoint?", "is this security
-module active?", "is this debug feature on?". A naive implementation:
-
-```c
-if (some_feature_enabled)
-        do_something();
-```
-
-Even when `some_feature_enabled` is almost always false, the CPU still must:
-
-1. Load `some_feature_enabled` from memory (a cache line).
-2. Compare it against zero.
-3. Predict/branch on the result.
-
-As [](#what-a-cpu-actually-does-with-instructions){.secref} worked out in detail, modern CPUs predict step 3 well, but
-"well" is not "free": prediction hides the misprediction penalty, not the
-**guaranteed memory load** in step 1. When the check sits in a hot path that
-runs millions of times a second (scheduler, networking, every `trace_*()`
-site), that unavoidable load adds up.
-
-**Jump labels remove the load and the compare for the common case** by
-rewriting the machine code at runtime. When the feature is off, the hot path
-literally has no branch to the rare code — it is a `nop` (or an unconditional
-`jmp` over an out-of-line block, depending on polarity). When someone turns
-the feature on, the kernel walks every call site for that key and overwrites
-`nop`↔`jmp` in place.
-
-Tradeoff in one sentence: **toggling is expensive** (machine-wide sync,
-text poke); **running the hot path is nearly free**.
 
 ---
 
