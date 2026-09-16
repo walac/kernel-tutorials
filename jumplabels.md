@@ -15,8 +15,8 @@ The first part of the document, that goes from section [](#the-problem-jump-labe
 to [](#how-to-use-static-keys-the-cookbook){.secref}, is focused on the API usage. If you just want
 to learn static keys to use them in your own code, you can stop there.
 
-The rest of this document is the implementation on **x86_64**, pinned
-to kernel **7.2**. It walks the bytes the compiler emits, the
+The rest of this document is the implementation on **x86_64**, based
+on the **7.2** kernel version. It walks the bytes the compiler emits, the
 jump-table metadata, `objtool`, boot vs live patching, the INT3 SMP
 protocol, and modules.
 
