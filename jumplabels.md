@@ -191,7 +191,7 @@ For grouping multiple toggles together, define an array using [`DEFINE_STATIC_KE
 DEFINE_STATIC_KEY_ARRAY_FALSE(keys, 4);
 
 if (static_branch_unlikely(&keys[i])) {
-	/* ... */
+    /* ... */
 }
 ```
 
@@ -201,7 +201,7 @@ When a key should be conditionally defined based on a Kconfig option, use [`DEFI
 DEFINE_STATIC_KEY_MAYBE(CONFIG_FOO, foo_key);
 
 if (static_branch_maybe(CONFIG_FOO, &foo_key)) {
-	/* ... */
+    /* ... */
 }
 ```
 
@@ -766,15 +766,11 @@ The x86 architecture also defines [`HAVE_JUMP_LABEL_BATCH`](https://elixir.bootl
 
 ## Core data structures {#core-data-structures}
 
-Two structs and one linker-collected table. The rest of the document keeps
-pointing at these.
+Runtime management of dynamic patching requires cooperative interaction between active state representation and static compiler metadata. The core subsystem models this relationship through unified control structures and metadata records that catalog every patching target across the system. These components link individual branch sites back to the central keys that govern them.
 
 ### [`struct static_key`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L86) {#struct-static-key}
 
-Every key you `DEFINE_STATIC_KEY_{TRUE,FALSE}` in C boils down, at runtime,
-to this same underlying struct — regardless of which macro you used (the
-`TRUE`/`FALSE` wrapper types that keep them distinct at compile time show
-up later in this section):
+Every static key declared via [DEFINE_STATIC_KEY_TRUE](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L362) or [DEFINE_STATIC_KEY_FALSE](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L371) boils down to a single runtime representation defined by `struct static_key`. Compile-time type wrappers maintain logical distinction during compilation, but they resolve to this identical underlying structure at runtime.
 
 ```c
 struct static_key {
@@ -789,47 +785,18 @@ struct static_key {
 };
 ```
 
-**[`enabled`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L87)** is the live state [](#how-to-use-static-keys-the-cookbook){.secref} and [](#two-polarities-key-default-branch-hint){.secref} keep referring to: an atomic
-refcount, `0` meaning off and any positive value meaning on (this is what
-lets [`static_branch_inc()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L513)/[`_dec()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L514) in [](#boolean-enable-vs-refcounted-enable){.secref} stack multiple owners on one
-key). It can also transiently hold **`-1`**, which means "the first
-[`static_key_slow_inc()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L186) on this key is in progress right now, patching the
-instruction stream" ([](#enabling-static-key-enable-static-branch-enable){.secref} covers that window in detail). While that is
-happening, any other reader calling [`static_key_count()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L104) still needs to
-see "enabled" rather than a confusing negative number, so that function
-maps `-1` back to `1` before returning it.
+The [enabled](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L87) field represents the active control state of the key. It is declared as an [atomic_t](https://elixir.bootlin.com/linux/v7.2/source/include/linux/types.h#L188) reference counter where a value of zero indicates the disabled state and any positive value indicates the enabled state. This design allows [static_branch_inc](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L513) and [static_branch_dec](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L514) to coordinate multiple stacked owners on a single key. During transitions, the field can temporarily hold the value `-1`, indicating that an initial call to [static_key_slow_inc](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L186) is actively patching the instruction stream. To prevent confusing readers during this transition window, [static_key_count](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L104) maps `-1` back to `1` before returning.
 
-The second field is where this struct gets unusual: it is one word that
-means two entirely different things, chosen by a tag bit hidden inside it.
-That is only possible because pointers to [`struct jump_entry`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L111) and [`struct
-static_key_mod`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L613) are both at least 4-byte aligned in practice, which means
-their real value always has its low 2 bits set to `0` — those 2 bits are
-free for the taking, so the union borrows them to store extra information
-instead of leaving them as always-zero padding:
+The second member of the struct is a tagged union residing in a single machine word. The low two bits of the word act as metadata flags. This optimization is possible because pointers to [struct jump_entry](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L111) and [struct static_key_mod](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L613) are at least 4-byte aligned on supported architectures. The alignment guarantees that the two least significant bits of any valid pointer address are zero, leaving them available for bitwise tagging.
 
 | Bit | Macro | Meaning |
 |---|---|---|
 | 0 | [`JUMP_TYPE_TRUE`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L195) | compile-time initial value of the key was `true` — this is the same `type` bit the `type ^ branch` formula from [](#two-polarities-key-default-branch-hint){.secref} uses |
 | 1 | [`JUMP_TYPE_LINKED`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L196) | `1`: the rest of the word is a `next` pointer (a linked list); `0`: it is an `entries` pointer (a flat array) |
 
-(Do not confuse this bit-packed word with the low 2 bits of `jump_entry::key`
-itself from [](#the-jump-table-entry-sidecar-metadata){.secref}/[](#struct-jump-entry-relative-form){.secref} — same trick, applied twice, to two unrelated pointers
-in two unrelated structs. One tags the type of *this* key itself and which
-pointer kind it holds; the other tags the branch hint of a call site and
-its init-section status.)
+This bit-packing strategy must not be confused with the tagging applied to the `key` field of `struct jump_entry`. While both employ similar bitwise operations on pointers, they serve different purposes. One tags the initial state of the key and the structure of the associated call-site list, while the other indicates the branch hint and init-section status of a specific call site.
 
-Bit 1 exists because a single, contiguous array is not always enough to
-describe every call site for a key. For a key only ever used inside
-`vmlinux` itself, the linker sees every call site at link time and can sort
-them all into one contiguous run inside [`__jump_table`](https://elixir.bootlin.com/linux/v7.2/source/scripts/module.lds.S#L31) ([](#relationship){.secref}) — `entries`
-just points at the start of that run. But a key can also be used from
-inside a *module*, loaded long after boot, with its own private
-`__jump_table` section that was never linked against the main kernel image
-at all ([](#linker-section){.secref}). There is no way to splice the entries of a module into the
-already-built vmlinux array after the fact, and modules can be loaded and
-unloaded repeatedly over the lifetime of the kernel, so the set of "all call
-sites for this key" can grow and shrink at runtime. When that happens, the
-union switches meaning: `next` becomes the head of a linked list of
+Bit 1 handles cases where call sites are distributed across separate compilation boundaries. For keys utilized solely within the core kernel image, the linker arranges all associated call sites into a single contiguous array inside the `__jump_table` section of `vmlinux`. The `entries` pointer then points directly to the start of this sequence. However, kernel modules loaded at runtime carry private `__jump_table` sections that cannot be merged post-link. Since modules are loaded and unloaded dynamically, the active set of call sites must grow and shrink. When a module introduces new call sites for an existing key, the representation transitions. The word shifts from a direct pointer to the head of a linked list composed of `struct static_key_mod` nodes, where each node tracks the contribution of a specific module.
 
 ```c
 struct static_key_mod {
@@ -839,38 +806,20 @@ struct static_key_mod {
 };
 ```
 
-nodes — one node per module currently contributing call sites for this key
-— rather than a direct pointer into one flat array. `JUMP_TYPE_LINKED`
-records, for a given key, which of these two representations is currently
-in effect.
+Subsystems outside the core jump label implementation in [kernel/jump_label.c](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c) do not interact with these raw bits directly. Accessor helpers like [static_key_entries](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L409), [static_key_type](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L415), [static_key_linked](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L420), and [static_key_set_entries](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L444) mask off the tag bits before returning pointers, insulating the rest of the kernel from the underlying representation.
 
-None of the code outside [`kernel/jump_label.c`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c) has to know any of this:
-accessors like [`static_key_entries()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L409), [`static_key_type()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L415),
-[`static_key_linked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L420), and [`static_key_set_entries()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L444) mask these two
-bits off before handing the pointer to anyone else, so the rest of the
-kernel just sees "the entries for this key," never the tag bits.
-
-Finally, the two type wrappers from [](#how-the-macros-pick-the-asm){.secref}, used by [`__builtin_types_compatible_p`](https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html),
-are trivial by design — each is nothing but a `struct static_key` in
-a differently-named box:
+The type wrappers [struct static_key_true](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L351) and [struct static_key_false](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L355) allow the compiler to distinguish key polarities at compile time. Each contains a single `struct static_key` member:
 
 ```c
 struct static_key_true  { struct static_key key; };
 struct static_key_false { struct static_key key; };
 ```
 
-Their entire purpose is to exist as two *distinct C types* the compiler can
-tell apart at compile time, even though they carry identical data —
-exactly what the [`static_branch_likely()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L474)/[`static_branch_unlikely()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L486) macros in [](#how-the-macros-pick-the-asm){.secref} rely on to
-pick the right arch helper.
+These distinct C types allow the preprocessor and compiler to select the appropriate branch behaviors. The macros [static_branch_likely](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L474) and [static_branch_unlikely](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L486) use compiler builtins to inspect the type of the passed key and dispatch execution to the correct architecture-specific code generation path.
 
 ### [`struct jump_entry`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L111) (relative form) {#struct-jump-entry-relative-form}
 
-This is the struct [](#the-jump-table-entry-sidecar-metadata){.secref} has already been building up piece by piece — the
-one [`JUMP_TABLE_ENTRY`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L15) writes one instance of, per call site, into
-[`__jump_table`](https://elixir.bootlin.com/linux/v7.2/source/scripts/module.lds.S#L31). x86 opts into a specific *variant* of it by selecting
-[`HAVE_ARCH_JUMP_LABEL_RELATIVE`](https://elixir.bootlin.com/linux/v7.2/source/arch/Kconfig#L509) in its Kconfig, which is what makes the
-struct look like this:
+This structure acts as the metadata record generated for each jump site. The [JUMP_TABLE_ENTRY](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L15) assembler macro writes one instance of this record per call site into the `__jump_table` section. The x86 architecture opts into a relative variant of this metadata structure by selecting the configuration option [HAVE_ARCH_JUMP_LABEL_RELATIVE](https://elixir.bootlin.com/linux/v7.2/source/arch/Kconfig#L509). This configuration alters the layout of `struct jump_entry`:
 
 ```c
 struct jump_entry {
@@ -880,43 +829,21 @@ struct jump_entry {
 };
 ```
 
-`code` and `target` hold the self-relative distances [](#the-jump-table-entry-sidecar-metadata){.secref} walked through in
-detail (`&entry->code + entry->code` recovers the real address of the
-patchable instruction, and likewise for `target`/`l_yes`); `key`, with its
-low 2 bits masked off, recovers the address of the owning `static_key` the
-same way. Architectures that do *not* select `HAVE_ARCH_JUMP_LABEL_RELATIVE` use a
-plainer struct instead, where all three fields simply *are* absolute
-addresses — which is visible directly in the accessors of that fallback
-itself (in [`jump_entry_code()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L117) there is just `return entry->code;`, no arithmetic at
-all). x86 pays the small extra cost of the "address of self plus stored
-offset" computation on every read in exchange for two things:
+The `code` and `target` fields contain self-relative offset distances rather than absolute pointer addresses. Reconstructing the absolute address of the patchable instruction is achieved by adding the value of `code` to the address of the `code` field itself. The target destination address is reconstructed similarly. The `key` field, after masking off the two least significant bits, resolves to the address of the governing `static_key` using the same self-relative offset arithmetic.
 
-1. **Size.** A kernel can easily contain tens of thousands of jump-table
-   entries — one per call site. `s32` (4 bytes) for `code`/`target` instead
-   of a full pointer-width field (8 bytes on x86_64) roughly halves the
-   size of two-thirds of every entry, multiplied across the whole table.
-2. **KASLR immunity**, which [](#the-jump-table-entry-sidecar-metadata){.secref} already derived in full: since `code` and
-   `target` are always within a couple of bytes of the single function they
-   belong to, a 32-bit signed distance can always reach; recovering the
-   address costs one addition instead of a boot-time fixup. `key` is kept
-   at full pointer width (`long`, not `s32`) because it points at a
-   `static_key`, which can live anywhere — including in a *different
-   module* from the one containing this call site, or in `vmlinux` while
-   the call site itself is in a module loaded who-knows-where in the
-   address space ([](#struct-static-key){.secref}). The distance between two independently-placed
-   pieces of memory like that can exceed what a signed 32-bit number can
-   express, so this one field cannot be shrunk the way `code`/`target` were.
+Architectures that do not select `HAVE_ARCH_JUMP_LABEL_RELATIVE` employ a standard fallback structure where the fields store absolute addresses. This distinction is visible in the accessors of the fallback structure (where [jump_entry_code](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L117) simply performs a direct pointer return with no arithmetic). On x86, paying the minor computational cost of the addition on every lookup yields significant advantages:
 
-The low 2 bits stolen from `key` — the same trick [](#struct-static-key){.secref} used on
-the pointer field of `static_key` itself, applied here to a different
-pointer for a different purpose — carry two more pieces of information:
+1. **Size Optimization:** A running kernel contains tens of thousands of individual branch sites. Storing offsets as 32-bit signed integers (`s32`) instead of full-width pointer values (8 bytes on x86_64) halves the size of two-thirds of each entry, substantially reducing the memory footprint of the total table.
+2. **KASLR Compatibility:** Because both the patchable code site and the target label reside within the boundaries of a single compiled function, a 32-bit signed offset is always sufficient to span the distance. The absolute address is resolved through relocation-free arithmetic, avoiding boot-time relocation fixups under Kernel Address Space Layout Randomization (KASLR). In contrast, the `key` field is kept at full pointer width (`long` instead of `s32`) because it references a `static_key` which can reside anywhere in the address space — including inside a different kernel module or the main `vmlinux` binary. Because the distance between a dynamically loaded module and the core kernel image can exceed the range of a 32-bit signed integer, this field must maintain full pointer width.
+
+The two least significant bits of the `key` pointer are reserved for encoding additional metadata. This pointer tagging strategy conveys two distinct pieces of information:
 
 | Bit | Meaning |
 |---|---|
-| 0 | [`jump_entry_is_branch`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L153): the `branch` hint from [](#two-polarities-key-default-branch-hint){.secref}/[](#how-the-macros-pick-the-asm){.secref} and the `"%c0 + %c1"` from [](#the-jump-table-entry-sidecar-metadata){.secref} — `1` if the call site used `likely()`, `0` for `unlikely()` |
-| 1 | [`jump_entry_is_init`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L158): `1` if the code for this site lives in `__init` text — freed after boot, and therefore unpatchable from that point on |
+| 0 | [jump_entry_is_branch](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L153): Represents the branch direction hint. A value of `1` indicates that the call site uses `likely()`, while `0` indicates `unlikely()`. |
+| 1 | [jump_entry_is_init](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L158): Indicates whether the target instruction resides within an initialization section (`__init` text). Such sections are freed after boot, rendering the associated call sites unpatchable from that point forward. |
 
-Both accessors are exactly as small as a single bit-check suggests:
+The inline accessors perform direct bitwise checks to retrieve these flags:
 
 ```c
 static inline bool jump_entry_is_branch(const struct jump_entry *entry)
@@ -930,17 +857,11 @@ static inline bool jump_entry_is_init(const struct jump_entry *entry)
 }
 ```
 
-Bit 1 is the same bit [](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref} followed through its "two lifetimes" story: at
-build time it briefly means "objtool, turn this `jmp` into a `nop`," and
-only *after* [`jump_label_init()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L525) has consumed that meaning and moved on
-does it settle into this second, permanent meaning for the rest of the
-uptime of the kernel.
+Bit 1 is the same marker tracked through two distinct lifetimes. During the initial build phase, it signals to `objtool` that a given jump instruction must be converted to a NOP. After [jump_label_init](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L525) processes this instruction and completes boot-time setup, the bit assumes the permanent meaning as the initialization-text flag for the remainder of the kernel uptime.
 
 ### Relationship {#relationship}
 
-[](#struct-static-key){.secref} and [](#struct-jump-entry-relative-form){.secref} described the two structs in isolation; this is how they fit
-together in memory, for a `static_key` holding a plain `entries` pointer
-(the common, non-module-linked case from [](#struct-static-key){.secref}):
+A standard [struct static_key](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L86) holds a direct `entries` pointer (the common, non-module-linked case) referencing the associated call sites in memory:
 
 ```
         struct static_key
@@ -958,33 +879,20 @@ __jump_table[]  (sorted by key, then by code address)
         +--> code / target / key <--+
 ```
 
-Notice `static_key` does not store *how many* call sites reference it, just
-a pointer to the *first* one. That is only enough information because of
-how the table is sorted: [`jump_label_sort_entries()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L80) orders the whole
-[`__jump_table`](https://elixir.bootlin.com/linux/v7.2/source/scripts/module.lds.S#L31) array not by the raw bits stored in `entry->key`, but by what
-[`jump_entry_key()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L127) decodes those bits into — the actual, absolute
-`static_key` address of the entry.
+The `struct static_key` structure does not store an explicit count of referencing call sites; it retains only a pointer to the first associated [struct jump_entry](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L111). This single pointer is sufficient because of the ordering established in the metadata array. The function [jump_label_sort_entries](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L80) sorts the whole `__jump_table` array. Sorting is performed not on the raw bits stored in the `key` field, but on the decoded, absolute target address returned by [jump_entry_key](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L127).
 
-That distinction matters because, like `code` and `target` ([](#the-jump-table-entry-sidecar-metadata){.secref}), `key`
-is self-relative: it stores a *distance to the key, measured from the
-address of this entry itself in the table*, not the address of the key
-directly. That is what
-the function does. It masks off the two flag bits ([](#struct-jump-entry-relative-form){.secref}) to recover the
-offset, then adds its own field address back in:
+This decoding is necessary because, like the `code` and `target` fields, the `key` field is self-relative. Rather than storing a direct absolute address, it holds the distance to the target key, measured from the own address of the field within the table entry. The inline helper function `jump_entry_key` masks off the two low-order metadata flags to isolate the offset, then adds the address of the `key` field itself to reconstruct the absolute address of the governing key:
 
 ```c
 static inline struct static_key *jump_entry_key(const struct jump_entry *entry)
 {
-	long offset = entry->key & ~3L;
+        long offset = entry->key & ~3L;
 
-	return (struct static_key *)((unsigned long)&entry->key + offset);
+        return (struct static_key *)((unsigned long)&entry->key + offset);
 }
 ```
 
-Two entries that both belong to the same `static_key` but sit at
-different slots in `__jump_table` measure that distance from two different
-starting points (`&entry->key` differs per slot), so their raw `key` bits
-will generally differ even though they mean "the same key":
+Consequently, two distinct table entries referring to the same central key but residing at different offsets within the table will measure distances from different starting points. Because the base address of each field differs per slot, the raw bit patterns stored in the `key` fields will differ even though they resolve to the same underlying control structure:
 
 ```
               addr of      raw key    decode: addr + raw key
@@ -997,38 +905,15 @@ slot 5 (B):   0x2000       +0x3000    0x2000 + 0x3000 = 0x5000  ─┘  static_k
                                            static_key @ 0x5000
 ```
 
-`0x4000` and `0x3000` look unrelated as raw bit patterns — a sort on those
-values would happily place A and B far apart. Only after factoring in the
-address of each entry itself do both resolve to the same `0x5000`, which is
-what `jump_entry_key()` — and therefore the sort — actually compares.
+While the raw values `0x4000` and `0x3000` share no common bit pattern, factoring in the absolute address of each entry yields the identical result `0x5000`. The sorting function uses this absolute address to order the table.
 
-With the array sorted that way, every entry for the same key ends up
-contiguous, so "find every call site for this key" is just "start at
-[`key->entries`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L97) and keep reading forward until the decoded key changes" — a
-plain linear scan, no index or count required.
+Once sorted, all entries associated with a given key occupy a contiguous sequence in memory. Locating every call site for a specific key requires starting at the address specified by the `entries` pointer of the key and scanning forward until the decoded key address changes. This layout eliminates the need to maintain an explicit count or index of associated call sites.
 
-Within that same-key run, entries get a secondary sort by
-[`jump_entry_code()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L117) — the decoded address of the patchable instruction
-itself — purely so that addresses come out in ascending order. The batched
-patching machinery from [](#x86-text-patching-the-gory-details){.secref} needs that ordering to do its work efficiently; without
-it, the entries for one key could point at instructions scattered
-arbitrarily across memory in no particular sequence.
+Within each contiguous key run, a secondary sort is performed using [jump_entry_code](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L117) to arrange the patchable instructions in ascending order of memory addresses. The instruction patching system requires this monotonic ordering to optimize batch patching operations and ensure predictable execution flows.
 
-**Why sorting a relative-offset table needs special care.** An ordinary
-in-place sort works by swapping raw bytes between two array slots — but
-here, swapping the bytes of two entries verbatim would silently corrupt
-both of them.
+Sorting relative-offset metadata requires specialized swap logic. A standard sorting algorithm swaps array elements through a byte-for-byte copy. However, because the fields of a relative entry encode distances computed relative to the own address of the entry, moving the record to a different slot without adjusting the fields would corrupt the pointers.
 
-The fields of each entry are self-relative ([](#the-jump-table-entry-sidecar-metadata){.secref}): they encode "distance
-from *my own* address to the target." Move the bytes of an entry to a
-different slot, and its own address changes, but a naive byte-for-byte copy would
-carry over distances computed for the *old* address, now pointing at the
-wrong place entirely. [`jump_label_swap()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L63) fixes this by computing
-`delta`, the fixed byte distance between the two slots being swapped, and
-adjusting every field by that same `delta` (adding it in one direction,
-subtracting it in the other) as part of the swap — so each field, now
-living at its new address, still decodes to exactly the same absolute
-target it did before:
+The helper function [jump_label_swap](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L63) prevents this corruption. During a swap, the function calculates the distance `delta` between the source and destination slots. It then adjusts the offsets in each field by adding or subtracting `delta` so that each relative field, now residing at a new address, continues to resolve to the same absolute target:
 
 ```c
 static void jump_label_swap(void *a, void *b, int size)
@@ -1048,24 +933,17 @@ static void jump_label_swap(void *a, void *b, int size)
 }
 ```
 
-Architectures using the plain, absolute-address form
-of [`jump_entry`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L111) ([](#struct-jump-entry-relative-form){.secref}) need none of this: an absolute address doesn't care
-which slot it happens to sit in, so a plain byte swap already works.
+Architectures that do not use the relative form of `struct jump_entry` are immune to this issue. Because absolute addresses remain valid regardless of where the containing entry resides, those architectures can rely on standard byte-for-byte swaps.
 
 ### Linker section {#linker-section}
 
-Every translation unit that expands [`JUMP_TABLE_ENTRY`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L15) ([](#the-jump-table-entry-sidecar-metadata){.secref}) contributes
-its own little `.pushsection __jump_table` ... `.popsection` block, scattered
-across dozens of separately-compiled `.o` files. Something still has to
-gather all of those into the one contiguous `__jump_table[]` array [](#relationship){.secref}
-assumes exists. That something is the main linker script of the kernel, via
-[`include/asm-generic/vmlinux.lds.h`](https://elixir.bootlin.com/linux/v7.2/source/include/asm-generic/vmlinux.lds.h#L436):
+Each translation unit expanding the [JUMP_TABLE_ENTRY](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L15) assembler macro emits a dedicated `.pushsection __jump_table` ... `.popsection` block. These metadata fragments are scattered across numerous compiled object files during compilation. To form a cohesive, contiguous table, the linker collects these fragments during the final link phase of the kernel image. The core kernel linker script directs this collation using the macro [BOUNDED_SECTION_BY](https://elixir.bootlin.com/linux/v7.2/source/include/asm-generic/vmlinux.lds.h#L224) defined in [include/asm-generic/vmlinux.lds.h](https://elixir.bootlin.com/linux/v7.2/source/include/asm-generic/vmlinux.lds.h#L224):
 
 ```c
 BOUNDED_SECTION_BY(__jump_table, ___jump_table)
 ```
 
-This macro expands to three linker-script directives:
+This macro expands to three linker directives:
 
 ```
 __start___jump_table = .;
@@ -1073,38 +951,13 @@ KEEP(*(__jump_table))
 __stop___jump_table = .;
 ```
 
-The middle line is the one doing the actual work: `*(__jump_table)` tells the
-linker "collect the [`__jump_table`](https://elixir.bootlin.com/linux/v7.2/source/scripts/module.lds.S#L31) input section from *every* object file
-being linked, in whatever order they're linked, and place them one after
-another, right here" — which is exactly how the individually-emitted
-entries of each translation unit end up concatenated into one array (the
-same "magic section" trick the kernel also uses for initcalls).
+The directive `*(__jump_table)` instructs the linker to extract the `__jump_table` input section from every compiled object file and arrange them sequentially in physical memory. This process concatenates the independently generated metadata entries into a unified array, leveraging the same linker-driven section aggregation mechanism utilized for system initialization calls.
 
-`KEEP(...)` matters because nothing in the C code of the kernel ever takes
-the address of this section or calls into it the way it would a normal
-function — as far as the dead-code elimination of the linker can tell, it
-looks unreferenced and safe to discard, so `KEEP` explicitly overrides
-that and forces it to stay.
+The `KEEP` modifier is crucial because the C code of the kernel does not directly reference individual elements within this section or invoke them like standard code symbols. Under aggressive dead-code elimination optimizations, the linker might categorize the section as unused and discard it. The `KEEP` instruction explicitly overrides this behavior, forcing the linker to preserve the accumulated table.
 
-The two assignments surrounding it, `__start___jump_table` and
-`__stop___jump_table`, are what let [`jump_label_init()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L525) find the bounds of
-the array at boot ([](#boot-jump-label-init){.secref}) — they resolve to the addresses immediately before and
-after the concatenated data, with no explicit entry count needed anywhere,
-mirroring how the linear scan by [`jump_entry_key()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L127) in [](#relationship){.secref} needed no count
-either.
+The surrounding assignments `__start___jump_table` and `__stop___jump_table` define the boundaries of the resulting array. During boot-time initialization, [jump_label_init](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L525) references these linker-defined symbols to locate the table in memory. Because these markers provide precise boundary addresses, the subsystem does not require an explicit compile-time count of table entries.
 
-That linker-driven concatenation only covers code built directly into
-`vmlinux`. A module compiled and loaded later has no way to participate in
-a linker script that already finished running long before the module even
-existed, so it carries its own private `__jump_table` section inside its
-own `.ko` file instead. When the module loader maps that module in, it
-reads that section itself and records its bounds in the two fields
-[`struct module`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/module.h#L397) reserves for exactly this — [`jump_entries`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/module.h#L511) (a pointer to the
-start of the array owned by that module) and [`num_jump_entries`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/module.h#L512) (how many entries
-it holds, since there is no `vmlinux`-wide linker symbol to bound it by).
-Those are precisely the entries that end up wrapped in a [`struct
-static_key_mod`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L613) node ([](#struct-static-key){.secref}) whenever a key is shared between a module and
-`vmlinux`, or between two modules.
+This linker-driven aggregation is confined to the static `vmlinux` binary. A kernel module loaded dynamically at runtime cannot participate in the link phase of the core kernel. Instead, each module maintains a private `__jump_table` section within the associated ELF object. When the module loading subsystem maps a module into memory, the loader reads this metadata and records the boundary addresses in two fields reserved inside [struct module](https://elixir.bootlin.com/linux/v7.2/source/include/linux/module.h#L397): [jump_entries](https://elixir.bootlin.com/linux/v7.2/source/include/linux/module.h#L511) stores the base address of the array, and [num_jump_entries](https://elixir.bootlin.com/linux/v7.2/source/include/linux/module.h#L512) stores the number of active entries. When a module shares a key with the main kernel or another module, these dynamically mapped entries are encapsulated inside [struct static_key_mod](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L613) nodes to integrate them into the central patching system.
 
 ---
 
@@ -1162,9 +1015,9 @@ above — when no such constant exists:
 static inline int jump_entry_size(struct jump_entry *entry)
 {
 #ifdef JUMP_LABEL_NOP_SIZE
-	return JUMP_LABEL_NOP_SIZE;
+    return JUMP_LABEL_NOP_SIZE;
 #else
-	return arch_jump_entry_size(entry);
+    return arch_jump_entry_size(entry);
 #endif
 }
 ```
