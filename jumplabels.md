@@ -19,33 +19,24 @@ To prevent confusion, this tutorial strictly distinguishes between two related t
 
 ## The problem jump labels solve {#the-problem-jump-labels-solve}
 
-Kernel code is full of rarely-taken checks that guard optional
-functionality: "is tracing enabled for this tracepoint?", "is this security
-module active?", "is this debug feature on?". A naive implementation:
+Kernel code is full of conditional checks that guard optional or debugging features: "is tracing enabled for this tracepoint?", "is this security module active?", "is this debugging feature on?". A standard C implementation:
 
 ```c
 if (some_feature_enabled)
         do_something();
 ```
 
-Even when `some_feature_enabled` is almost always false, the CPU still must:
+Even when `some_feature_enabled` remains false almost indefinitely, the CPU must still perform three steps:
 
-1. Load `some_feature_enabled` from memory (a cache line).
-2. Compare it against zero.
-3. Predict/branch on the result.
+1. Load `some_feature_enabled` from its cache line into a register.
+2. Compare the register value against zero.
+3. Predict and branch based on the result.
 
-Modern CPUs predict step 3 well, but prediction hides the misprediction
-penalty, not the **guaranteed memory load** in step 1. When the check sits
-in a hot path that runs millions of times a second (scheduler, networking,
-every `trace_*()` site), that load adds up.
+Modern branch predictors handle the conditional branch in step 3 with high accuracy, hiding the misprediction penalty. However, branch prediction cannot bypass the **guaranteed memory load** in step 1. When this check resides in a hot path executed millions of times per second (such as the scheduler, network packet processing, or tracepoint triggers), the cumulative overhead of those memory accesses becomes a measurable performance bottleneck.
 
-**Jump labels remove the load and the compare for the common case** by
-rewriting the machine code at runtime. When the feature is off, the hot path
-has no branch to the rare code — it is a `nop` (or an unconditional `jmp`).
-When someone turns the feature on, the kernel walks every call site for that key and swaps `nop` and `jmp` in place.
+**Jump labels eliminate both the memory access and the comparison for the common path** by rewriting the instructions at runtime. When the feature is inactive, the instruction pipeline encounters a no-operation (`nop`) instruction (or an unconditional branch that bypasses the out-of-line code). When a subsystem activates the feature, the kernel traverses all call sites registered for that static key and patches the instructions in place.
 
-Tradeoff in one sentence: **toggling is expensive** (machine-wide sync,
-text poke); **running the hot path is nearly free**.
+The design tradeoff is stark: **toggling is expensive** because it requires a machine-wide CPU synchronization and precise text patching, but **running the hot path is virtually free**.
 
 ---
 
