@@ -1026,9 +1026,7 @@ The patching engine invokes [memcmp()](https://elixir.bootlin.com/linux/v7.2/sou
 
 ## Life of a static key: boot, enable, disable {#life-of-a-static-key-boot-enable-disable}
 
-Everything in this section is driven by one [`atomic_t`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/types.h#L188): [`key->enabled`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L87). Its
-value tells you both "is the feature on" and "is a patch pass currently
-running". The boolean on/off cycle looks like this:
+A single `atomic_t` variable, [`key->enabled`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L87), drives the entire lifecycle of a static key. The value of this variable indicates both whether the associated feature is active and whether a code-patching pass is currently executing. The basic cycle of boolean activation and deactivation proceeds through the following transitions:
 
 ```
         set to -1          patch, set 1          cmpxchg(1,0), off
@@ -1038,25 +1036,15 @@ running". The boolean on/off cycle looks like this:
  off               enable                  on                        off
 ```
 
-Read left to right, the three values in that diagram mean:
+Reading the state diagram from left to right, the three key values represent distinct operational states:
 
-- **`0`** — off. Every site for this key holds whichever instruction (`nop`
-  or `jmp`) means "disabled" for its polarity ([](#two-polarities-key-default-branch-hint){.secref}).
-- **`-1`** — transient: an enable is in progress, [`jump_label_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L886) is
-  actively rewriting every site right now. This value exists so that no
-  concurrent reader can ever observe `0` during that window and wrongly
-  conclude the feature is still off while the patcher is mid-flight;
-  [`static_key_count()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L104) deliberately reports `-1` as "1" (enabled) to close
-  that gap.
-- **`1`** — on, with the refcount sitting at exactly one net enable (the
-  refcounting ladder below explains what "net" means here).
+- **`0`** — The feature is disabled. Every associated instruction site holds the specific instruction (either a NOP or a jump) that represents the disabled state for the polarity of that site ([](#two-polarities-key-default-branch-hint){.secref}).
+- **`-1`** — The key is in a transient enablement state. The function [`jump_label_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L886) is actively rewriting the instruction sites. This transient value prevents concurrent execution paths from observing a `0` value and mistakenly concluding that the feature is disabled while code patching is in progress. The function [`static_key_count()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L104) deliberately translates a `-1` value to `1` (enabled) to eliminate this race window.
+- **`1`** — The feature is enabled, with the reference count at exactly one active enablement (the refcounting model below clarifies what this means).
 
-There is no symmetric `-1`-like transient for *disable*: going `1 -> 0` reads
-as briefly stale "on" instead (see [](#disabling){.secref}), which is harmless.
+No symmetric `-1` transient exists during deactivation. Transitioning from `1` to `0` means readers may briefly observe a stale "enabled" state (see [](#disabling){.secref}), which does not compromise system correctness.
 
-Above value `1`, a second, independent ladder exists purely for refcounting —
-[`static_branch_inc()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L513)/[`static_branch_dec()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L514) ([](#boolean-enable-vs-refcounted-enable){.secref}) climb and descend it *without ever
-touching text*, because the key is already known to be enabled:
+When the reference count exceeds `1`, the kernel uses an independent reference-counting ladder. The functions [`static_branch_inc()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L513) and [`static_branch_dec()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L514) ([](#boolean-enable-vs-refcounted-enable){.secref}) ascend and descend this ladder without performing any code modifications, because the key is already active:
 
 ```
    1 --inc--> 2 --inc--> 3 --inc--> ...        (static_key_fast_inc_not_disabled:
@@ -1064,51 +1052,17 @@ touching text*, because the key is already known to be enabled:
                                                   no jump_label_update() at all)
 ```
 
-Only a dec that would land exactly on `1 -> 0` re-enters the boolean cycle
-above and triggers a real patch-off. Put differently: of all the edges
-across both diagrams, only the three that make up the boolean cycle itself
-(`0 -> -1`, `-1 -> 1`, and `1 -> 0`) ever touch instruction bytes. Every
-step on the refcount ladder above `1` (`1<->2`, `2<->3`, …) is a bare
-atomic increment or decrement, with no
-`jump_label_update()` call anywhere in it.
+Only a decrement that lands precisely on the transition from `1` to `0` re-enters the primary boolean cycle and triggers instruction patching. Across both state machines, only the three boundary transitions (`0 -> -1`, `-1 -> 1`, and `1 -> 0`) execute code modifications. Every state change on the ladder above `1` performs only a raw atomic increment or decrement, bypassing `jump_label_update()` entirely.
 
-That is why the refcounted API in [](#boolean-enable-vs-refcounted-enable){.secref} exists: many
-callers can share a key without each one paying for a text-patch
-round-trip — the cost of patching is paid exactly once, by whichever caller
-happens to be the first to enable it or the last to disable it.
+This optimization justifies the reference-counted API introduced in [](#boolean-enable-vs-refcounted-enable){.secref}. Multiple kernel subsystems can share a single static key without incurring individual patching overhead. The kernel incurs the cost of code patching exactly once: when the first subsystem enables the key, or when the final subsystem disables it.
 
 ### Boot: [`jump_label_init()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L525) {#boot-jump-label-init}
 
-Before this function ever runs, the jump-label machinery is in a half-built
-state. The linker has already concatenated the slice of
-[`__jump_table`](https://elixir.bootlin.com/linux/v7.2/source/scripts/module.lds.S#L31) from every translation unit into one array ([](#linker-section){.secref}), but that array is simply in link
-order — sites for the same key can be scattered anywhere in it, and
-[`key->entries`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L97) still holds whatever its static initializer left there,
-which for a plain `struct static_key key = STATIC_KEY_INIT_FALSE;` ([](#struct-static-key){.secref})
-is nothing useful. In other words: the raw table of call sites exists, but
-nothing yet knows *which* sites belong to *which* key, so
-[`static_branch_enable()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L522) or [`static_key_slow_inc()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L186) ([](#boolean-enable-vs-refcounted-enable){.secref}, [](#enabling-static-key-enable-static-branch-enable){.secref}) would have
-nothing to walk if called this early.
+During early boot, the jump-label subsystem remains in an uninitialized state. The compiler and linker concatenate the [`__jump_table`](https://elixir.bootlin.com/linux/v7.2/source/scripts/module.lds.S#L31) sections from individual object files into a single continuous array ([](#linker-section){.secref}). However, this array is arranged in link order, meaning the call sites associated with a given key are scattered. Furthermore, [`key->entries`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L97) holds only the default value from the static initializer (such as a null pointer for `struct static_key key = STATIC_KEY_INIT_FALSE;` ([](#struct-static-key){.secref})), which does not point to the table of call sites. Without establishing this mapping, any early invocation of [`static_branch_enable()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L522) or [`static_key_slow_inc()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L186) ([](#boolean-enable-vs-refcounted-enable){.secref}, [](#enabling-static-key-enable-static-branch-enable){.secref}) would have no target sites to traverse.
 
-[`arch/x86/xen/multicalls.c`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/xen/multicalls.c) declares
-[`static struct static_key mc_debug __ro_after_init;`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/xen/multicalls.c#L60) and registers
-[`xen_mc_debug`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/xen/multicalls.c#L78) as an [`early_param()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/init.h#L354)
-whose [`xen_parse_mc_debug()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/xen/multicalls.c#L71) callback calls
-[`static_key_slow_inc(&mc_debug)`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L186) directly, synchronously,
-while [`parse_early_param()`](https://elixir.bootlin.com/linux/v7.2/source/init/main.c#L743) is walking the command line. If that increment
-ran before `jump_label_init()` had sorted the table and pointed `mc_debug`
-at its entries, it would have nothing to patch and the key would silently
-stay un-patched despite the user asking for it on the command line.
+Concretely, the early-boot Xen initialization code in [`arch/x86/xen/multicalls.c`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/xen/multicalls.c#L1) illustrates the danger of this uninitialized window. The file declares a static key [`static struct static_key mc_debug __ro_after_init;`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/xen/multicalls.c#L60) and registers a parameter parser callback [`xen_parse_mc_debug()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/xen/multicalls.c#L71) via [`early_param()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/init.h#L354). This callback invokes [`static_key_slow_inc(&mc_debug)`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L186) synchronously as the kernel parses early boot arguments. If this increment occurs before `jump_label_init()` organizes the jump table, the kernel cannot locate or patch the sites associated with the key, leaving the debugging option permanently disabled.
 
-The kernel guards against exactly this ordering mistake with one boolean,
-[`static_key_initialized`](https://elixir.bootlin.com/linux/v7.2/source/init/main.c#L174) — whose only job, per its own comment, is "to
-generate warnings if `static_key` manipulation functions are used before
-`jump_label_init` is called";
-[`jump_label_init_ro()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L573) later even enforces it
-with a `WARN_ON_ONCE()`. That is why `jump_label_init()` is called very early
-from [`start_kernel()`](https://elixir.bootlin.com/linux/v7.2/source/init/main.c#L972) in [`init/main.c`](https://elixir.bootlin.com/linux/v7.2/source/init/main.c), strictly before
-`parse_early_param()` gets a chance to run any handler like
-`xen_parse_mc_debug()`:
+To guard against this ordering hazard, the kernel maintains a state boolean named [`static_key_initialized`](https://elixir.bootlin.com/linux/v7.2/source/init/main.c#L174). The sole purpose of this variable is to generate kernel warnings if code attempts to manipulate static keys before initialization. The function [`jump_label_init_ro()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L573) enforces this order via `WARN_ON_ONCE()`. Consequently, [`start_kernel()`](https://elixir.bootlin.com/linux/v7.2/source/init/main.c#L972) in [`init/main.c`](https://elixir.bootlin.com/linux/v7.2/source/init/main.c#L1) invokes `jump_label_init()` at an early stage, strictly before parsing command-line parameters:
 
 ```c
 void __init jump_label_init(void)
@@ -1133,35 +1087,17 @@ void __init jump_label_init(void)
 }
 ```
 
-Before the loop even starts, [`jump_label_sort_entries()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L80)
-sorts the whole of `__jump_table` by key, then by code address — the
-precondition that lets the "walk all sites for this key as a linear scan"
-from [](#relationship){.secref} and the "batch must stay address-ordered" requirement from [](#batching-api-used-by-jump-labels){.secref} both work later.
+Before entering the loop, [`jump_label_sort_entries()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L80) sorts the jump table using the key address as the primary key and the code address as the secondary key. This sorting step ensures that all entries associated with a single key reside in a contiguous range, which enables fast linear lookups ([](#relationship){.secref}) and facilitates batched, address-ordered code patching ([](#batching-api-used-by-jump-labels){.secref}).
 
-The loop that follows does three things per entry, in this order, trusting
-that the table is already sorted:
+The subsequent initialization loop processes each entry sequentially and performs three sequential tasks:
 
-1. Optionally run [`arch_jump_label_transform_static`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L402) for NOP sites — **a
-   no-op on x86**, since `objtool` and the compiler have already left the
-   right bytes in place ([](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref}); other architectures without that build-time
-   trick do real work here.
-2. Mark `__init` sites, so nothing later tries to patch a call site living
-   in memory that will be freed once init finishes.
-3. Point each key at the first entry of its contiguous run in the
-   now-sorted table, so [`key->entries`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L97) is ready to use the moment something
-   calls `static_branch_enable()`.
+1. **Verify default instructions.** The loop invokes `arch_jump_label_transform_static` on NOP sites. This operation is a no-op on x86 because build-time tools already insert the correct default bytes ([](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref}), but other architectures rely on this call to write initial instruction bytes.
+2. **Flag initialization sections.** The loop checks whether the target code resides in an `__init` text section. Identifying these sites ensures that subsequent runtimes do not attempt to write to memory addresses that are freed after boot.
+3. **Establish key-to-entry mappings.** The loop associates each key with the start of its contiguous entry block in the sorted table. This step populates `key->entries` so that future runtime operations can immediately resolve the target locations.
 
-None of this touches instruction bytes for sites that are already correct:
-the compiled-in `nop`/`jmp` already matches the initial value of each key ([](#two-polarities-key-default-branch-hint){.secref}).
-What this pass builds is bookkeeping — sort order, the `__init` flag, and
-the `entries` pointer — so that a *later* toggle knows exactly which sites
-to patch and in what order.
+This initialization pass avoids modifying instruction bytes if the compiled default state matches the initial value of the key ([](#two-polarities-key-default-branch-hint){.secref}). The pass functions exclusively as a bookkeeping step to establish sorting, flag initialization regions, and configure metadata pointers before any code patching begins.
 
-`jump_label_init_ro()` runs much later, from [`mark_readonly()`](https://elixir.bootlin.com/linux/v7.2/source/init/main.c#L1511). It walks
-`__jump_table` a second time, but this pass skips almost everything —
-it only acts on keys that [`is_kernel_ro_after_init()`](https://elixir.bootlin.com/linux/v7.2/source/include/asm-generic/sections.h#L183) recognizes as
-living in [`__ro_after_init`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/cache.h#L60) storage.[^ro-after-init] For each matching key
-it calls:
+At a later stage of the boot sequence, `jump_label_init_ro()` runs inside [`mark_readonly()`](https://elixir.bootlin.com/linux/v7.2/source/init/main.c#L1511). This function scans `__jump_table` again but restricts its operations to keys annotated with [`__ro_after_init`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/cache.h#L60), which denotes variables written during initialization but protected from write access thereafter.[^ro-after-init] For every matching key, it invokes the sealing helpers:
 
 ```c
 static inline bool static_key_sealed(struct static_key *key)
@@ -1176,13 +1112,7 @@ static inline void static_key_seal(struct static_key *key)
 }
 ```
 
-[`static_key_seal()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L567) keeps only the [`JUMP_TYPE_TRUE`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L195) bit of the
-current [`key->type`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L96) and throws the rest of the word away, replacing it with
-[`JUMP_TYPE_LINKED`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L196) plus that one preserved bit. Recall from [](#struct-static-key){.secref} that this
-word is normally a tagged pointer — the low 2 bits are a type tag, and
-everything above them is either the `entries` pointer the loop earlier in
-this section just installed, or a module-chain `next` pointer from [](#modules-the-trickiest-part){.secref}. Sealing
-collapses it down to just the tag, with nothing left standing above bit 1:
+The function [`static_key_seal()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L567) preserves only the [`JUMP_TYPE_TRUE`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L195) bit of the current [`key->type`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L96) field and clears the rest of the word, substituting the remaining bits with the [`JUMP_TYPE_LINKED`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L196) tag. In normal operation, this field functions as a tagged pointer to either the `entries` array or a module-chain `next` pointer ([](#modules-the-trickiest-part){.secref}). Sealing strips the pointer value, collapsing the state down to a bare tag value where all bits above bit 1 are cleared:
 
 ```
 before sealing (a live `entries` or `next` pointer, tagged):
@@ -1196,74 +1126,30 @@ after static_key_seal():
     [ 0000000000000000000000000000000000000000 ] [ 1 ] [ T ]
 ```
 
-`T` is the preserved `JUMP_TYPE_TRUE` bit; `L` is
-`JUMP_TYPE_LINKED`. [`static_key_sealed()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L562) is exactly the
-test for the "after" picture — `JUMP_TYPE_LINKED` set and nothing above
-bit 1 — so it can recognize a sealed key at a glance, regardless of which
-of the two pointer kinds that word used to hold.
+In this layout, `T` represents the preserved `JUMP_TYPE_TRUE` bit, and `L` represents `JUMP_TYPE_LINKED`. The helper [`static_key_sealed()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L562) verifies that `JUMP_TYPE_LINKED` is set and all upper bits are clear. This layout allows the kernel to identify a sealed key quickly without checking the previous pointer variant.
 
-Several call sites can share the same key, so this loop visits the same key
-more than once as it walks the table entry by entry.
-`static_key_sealed()` is checked before
-`static_key_seal()` runs, so the first visit seals the key and every later
-visit for that same key becomes a no-op.
+Because multiple entries in the sorted table can reference the same static key, the loop encounters certain keys multiple times. Checking `static_key_sealed()` before invoking `static_key_seal()` ensures that only the first visit performs the sealing operation, while subsequent visits are bypassed.
 
-This is safe only because `__ro_after_init` is a promise that the key is
-never toggled again after boot: once sealed, [`key->entries`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L97) is gone, so
-nothing could walk it even if some later code mistakenly tried.
+This sealing step is safe because keys marked as `__ro_after_init` are guaranteed never to toggle after initialization. Removing the `entries` pointer prevents subsequent code updates from traversing the table of sites.
 
-The payoff shows up in [](#modules-the-trickiest-part){.secref}. When a module loaded afterward references a
-sealed key, [`jump_label_add_module()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L690) skips allocating and chaining a
-[`struct static_key_mod`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L613) for it — the bookkeeping [](#modules-the-trickiest-part){.secref} otherwise needs so a
-*future* toggle can find and patch call sites living in other modules.
-Instead, it just patches the sites of that module once, immediately, to
-match the already-final value of the key.
+This optimization yields benefits during module loading ([](#modules-the-trickiest-part){.secref}). When a module references a sealed key, [`jump_label_add_module()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L690) skips the allocation and chaining of a [`struct static_key_mod`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L613) tracking structure. Rather than maintaining this list for potential future updates, the loader patches the instructions of the module immediately to match the permanent state of the key.
 
-The ordering against [`mark_rodata_ro()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/init_64.c#L1405) follows
-from the same fact: sealing is the last write anything makes to
-[`key->type`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L96), and that field sits inside the very `__ro_after_init` section
-`mark_rodata_ro()` is about to make actually read-only in the page tables.
-Running first just means the field has already settled into its final
-value before write access to it disappears.
+This step runs before [`mark_rodata_ro()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/init_64.c#L1405). Because sealing modifies the `key->type` field, the write must execute before the memory region containing the key is remapped read-only in the page tables.
 
-[^ro-after-init]: `__ro_after_init` is a section attribute
-    ([`include/linux/cache.h`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/cache.h#L60), `__section(".data..ro_after_init")`) for
-    data that is written during boot but never again afterward — unlike
-    `const`, which the compiler must be able to enforce at compile time,
-    this is a promise the *author* makes about runtime behavior. The kernel
-    makes that promise real at `mark_rodata_ro()` time, when the whole
-    `.data..ro_after_init` section is remapped read-only in the page
-    tables, so any later write attempt — a bug, or an author breaking their
-    own promise — faults instead of silently corrupting state.
+[^ro-after-init]: The `__ro_after_init` section attribute ([`include/linux/cache.h`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/cache.h#L60)) marks variables that must remain writable during early boot but read-only for the remainder of system uptime. This attribute differs from `const`, which is enforced by the compiler at compile time. Instead, the kernel enforces this protection at runtime during `mark_rodata_ro()` by remapping the page tables of the `.data..ro_after_init` section to read-only status. Any subsequent attempt to modify these fields will trigger a page fault, preventing silent state corruption.
 
 ### Enabling: [`static_key_enable()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L220) / [`static_branch_enable()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L522) {#enabling-static-key-enable-static-branch-enable}
 
-[`jump_label_init()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L525) ([](#boot-jump-label-init){.secref}) only builds bookkeeping — it never flips a
-key. Every site in the kernel image boots running whatever `nop`/`jmp` the
-compiler and `objtool` baked in ([](#two-polarities-key-default-branch-hint){.secref}, [](#what-the-compiler-emits-x86-64){.secref}), on or off, and stays that way
-until something calls `static_branch_enable()` or
-[`static_key_slow_inc()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L186) for the first time. This section is about that
-first flip, which can happen years into uptime, on a system where other
-CPUs may already be executing the very instructions about to be rewritten.
+Initialization only configures the metadata of the jump table and does not toggle static keys. Every site in the compiled kernel image begins execution using the default instruction (either a NOP or a jump) encoded by the compiler and `objtool` ([](#two-polarities-key-default-branch-hint){.secref}, [](#what-the-compiler-emits-x86-64){.secref}). The instructions remain unchanged until code invokes `static_branch_enable()` or [`static_key_slow_inc()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L186) for the first time. This first transition can occur long after system boot on a live symmetric multiprocessing system where other CPUs are concurrently executing the instructions slated for modification.
 
-[`drivers/md/dm-stats.c`](https://elixir.bootlin.com/linux/v7.2/source/drivers/md/dm-stats.c#L419) shows a concrete case of this ([](#reading-the-state-without-taking-the-branch){.secref}): the first
-time a user asks the device-mapper stats ioctl to start recording
-per-region I/O counters, it flips [`stats_enabled`](https://elixir.bootlin.com/linux/v7.2/source/drivers/md/dm.c#L76), a key that has sat
-disabled since boot:
+For instance, the device-mapper statistics driver in [`drivers/md/dm-stats.c`](https://elixir.bootlin.com/linux/v7.2/source/drivers/md/dm-stats.c#L419) demonstrates a typical use case ([](#reading-the-state-without-taking-the-branch){.secref}). The first time a user requests I/O statistics monitoring, the control interface toggles `stats_enabled`, a static key declared in [`drivers/md/dm.c`](https://elixir.bootlin.com/linux/v7.2/source/drivers/md/dm.c#L76) that defaults to the disabled state:
 
 ```c
 if (!static_key_enabled(&stats_enabled.key))
         static_branch_enable(&stats_enabled);
 ```
 
-The guard matters as much as the call: it is what keeps a second, third, or
-hundredth request for the same device from re-triggering a full patch round
-once the key is already on ([](#reading-the-state-without-taking-the-branch){.secref}). But the first time through, this
-[`static_branch_enable(&stats_enabled)`](https://elixir.bootlin.com/linux/v7.2/source/drivers/md/dm-stats.c#L420) does run, and from that call onward
-every `stats_enabled` check in the I/O path — on every CPU, some of which
-may be running that exact code right now — has to observe the new state,
-and none of them may ever see a half-patched instruction.
-[`static_key_enable_cpuslocked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L197) below is what makes that safe:
+Checking the current state before enabling is a critical optimization. This guard prevents subsequent registration requests from triggering redundant code patching operations once the key is active ([](#reading-the-state-without-taking-the-branch){.secref}). On the initial request, `static_branch_enable(&stats_enabled)` runs. From that moment, every enablement check in the I/O path across all CPUs must immediately observe the active state without encountering half-patched instructions. The function [`static_key_enable_cpuslocked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L197) implements this transition safely:
 
 ```c
 void static_key_enable_cpuslocked(struct static_key *key)
@@ -1279,29 +1165,17 @@ void static_key_enable_cpuslocked(struct static_key *key)
 }
 ```
 
-Walking through what that function does, in order:
+The function executes the following sequential steps to enable the key:
 
-1. It first checks whether the key is already enabled, and bails out if so.
-2. [`jump_label_mutex`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L23) serializes all jump-label patching globally, so two
-   callers enabling different keys at the same time still cannot have
-   their text pokes race one another.
-3. It sets `enabled = -1` before touching any code — this is the `0 → -1`
-   transient from the state diagram above, and it is what makes
-   [`jump_label_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L886) below safe to run concurrently with readers:
-   [`static_key_count()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L104) and [`static_key_enabled()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L407) both treat `-1` as
-   enabled, so no concurrent reader ever sees a window of "disabled" while
-   sites are only half-patched.
-4. `jump_label_update()` does the actual work: it patches every site for
-   this key ([](#jump-label-update-jump-label-update){.secref}).
-5. Finally, it stores `1`.
+1. **Verify current status.** The function reads the enablement count and returns immediately if the key is already active.
+2. **Serialize concurrent updates.** The function acquires the global mutex [`jump_label_mutex`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L23) to prevent concurrent patching passes from executing simultaneously.
+3. **Write the transient indicator.** The function sets the enablement variable to `-1`. This value represents a transient state that concurrent readers interpret as enabled, ensuring that no CPU observes a disabled state during the patching window.
+4. **Perform instruction patching.** The function invokes [`jump_label_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L886) to rewrite the instructions at all registered call sites.
+5. **Publish the final active state.** The function writes `1` to the enablement variable to establish the permanent active state and release the transient state.
 
-`static_key_enable()` wraps this in [`cpus_read_lock()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/cpu.c#L488) so CPUs cannot come
-online mid-patch.
+The wrapper function `static_key_enable()` encloses this procedure in a [`cpus_read_lock()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/cpu.c#L488) block to prevent CPU hotplug events during instruction modification.
 
-The refcounted path, [`static_key_slow_inc_cpuslocked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L151), is not just this
-same function reused for `inc`/`dec` ([](#boolean-enable-vs-refcounted-enable){.secref}). With multiple independent
-owners, more than one CPU can call it at once, and only one of them may
-actually be the one that flips `0 → 1`:
+The reference-counted counterpart, [`static_key_slow_inc_cpuslocked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L151), uses different logic rather than simply invoking the boolean enablement path ([](#boolean-enable-vs-refcounted-enable){.secref}). With multiple subsystems sharing a single key, concurrent increments can occur simultaneously, and only the first caller must perform the transition from `0` to `1`:
 
 ```c
 bool static_key_slow_inc_cpuslocked(struct static_key *key)
@@ -1323,15 +1197,9 @@ bool static_key_slow_inc_cpuslocked(struct static_key *key)
 }
 ```
 
-It tries a lock-free fast path first (below), and only takes
-`jump_label_mutex` if that fails. Past that point it is the same `0 → 1`
-dance as `static_key_enable_cpuslocked()` above: exactly one caller
-actually performs the transition and runs `jump_label_update()`; anyone
-else who reaches the mutex finds the key already on and just falls back to
-the fast path to add their own count.
+The function first attempts a lock-free fast path and acquires `jump_label_mutex` only if that attempt fails. Inside the locked region, it executes the same boundary transition protocol: exactly one thread executes the transition and runs `jump_label_update()`, while subsequent callers find the key already active and fall back to the fast path to register their reference counts.
 
-[`static_key_fast_inc_not_disabled()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L127) is what makes "further incs" in the table
-from [](#boolean-enable-vs-refcounted-enable){.secref} cost nothing more than an atomic — no lock, no text poke:
+The helper function [`static_key_fast_inc_not_disabled()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L127) guarantees that increments beyond the initial transition require only a single atomic operation without acquiring locks or patching instruction text:
 
 ```c
 bool static_key_fast_inc_not_disabled(struct static_key *key)
@@ -1358,31 +1226,15 @@ bool static_key_fast_inc_not_disabled(struct static_key *key)
 }
 ```
 
-The retry loop only succeeds once it can prove, atomically, that the count
-is already an ordinary positive number. `v <= 0` catches both a genuinely
-disabled key (`0`) and an enable already in progress (`-1`), sending both
-cases down to the slow path above instead of incrementing a value that
-doesn't mean what it looks like yet. `v == INT_MAX` guards against overflows.
+The compare-and-swap loop succeeds only when it verifies atomically that the count is a positive integer. A count value less than or equal to `0` represents either a disabled key (`0`) or an active enablement pass (`-1`). The loop redirects both cases to the slow path rather than incrementing a transient or inactive state. A count equal to `INT_MAX` is blocked to prevent integer overflow.
 
 ### Disabling {#disabling}
 
-[](#enabling-static-key-enable-static-branch-enable){.secref} walked through what happens when a key crosses from off to on.
-Disabling is the same problem in reverse: patch every site back to its
-original instruction, without letting any reader ever observe a torn one.
-It runs on the very same rule as enabling — not every call to
-`disable`/`dec` needs to touch an instruction at all.
-[`jump_label_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L886) only has to run on the one transition that actually
-flips what is patched into the instruction stream: `1 → 0` for the boolean
-API, `N → 0` for the refcounted one. Every other call just moves a plain
-integer and can be answered with a single atomic instruction — no lock, no
-text poke, because nothing about the patched code needs to change.
+Disabling a static key reverses the enablement process, restoring every associated instruction site to the original default instruction. Like enablement, deactivation avoids code modification on most calls. The function [`jump_label_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L886) executes only during the single boundary transition that alters the instruction stream: the transition from `1` to `0` for the boolean API, and from `1` to `0` for the reference-counted API. All other calls simply modify an integer count using a single atomic instruction, avoiding global locks and code patching.
 
-That is exactly the same shape as the
-[`static_key_fast_inc_not_disabled()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L127) from [](#enabling-static-key-enable-static-branch-enable){.secref} on the enable side — a bare CAS
-loop, no lock, no patch, for every increment that doesn't cross `0 → 1`.
-That rule (every transition that isn't on a patch-triggering boundary is a
-bare atomic op) is what both functions below are built around, on either
-side of the key.
+This logic mirrors the fast-path behavior of [`static_key_fast_inc_not_disabled()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L127) ([](#enabling-static-key-enable-static-branch-enable){.secref}). Any state transition that does not cross a patching boundary operates as a lock-free atomic transaction. This principle structures both enablement and deactivation operations on either side of the key.
+
+The function [`static_key_disable_cpuslocked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L228) implements deactivation for the boolean API:
 
 ```c
 void static_key_disable_cpuslocked(struct static_key *key)
@@ -1400,43 +1252,11 @@ void static_key_disable_cpuslocked(struct static_key *key)
 }
 ```
 
-[`static_key_disable_cpuslocked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L228) is the mirror, in the boolean API, of the
-enable path from [](#enabling-static-key-enable-static-branch-enable){.secref}, but it skips the `-1` choreography.
-It first checks
-that the key is currently exactly `1`, bailing out (and warning if the
-value isn't `0` either, which would mean the boolean and refcounted APIs
-got mixed on this key — [](#boolean-enable-vs-refcounted-enable){.secref}) before doing anything else. The actual
-disable is then a single `atomic_cmpxchg(&key->enabled, 1, 0)`: "if the
-value is currently `1`, replace it with `0`, and tell me whether you
-succeeded." If some other CPU changed it first, the compare fails and this
-call does nothing further. Only on success does it call
-`jump_label_update()` to patch every site for this key back to its
-disabled instruction.
+The function first verifies that the enablement count equals exactly `1`, returning early if the count is already `0`. A mismatch value triggers a warning, indicating an improper mixing of the boolean and reference-counted APIs ([](#boolean-enable-vs-refcounted-enable){.secref}). Deactivation proceeds through a single compare-and-swap operation. If the value is `1`, the call sets the count to `0` and triggers `jump_label_update()` to restore the default instructions. If a concurrent execution path alters the variable first, the compare-and-swap fails and the function exits without performing further work.
 
-Compare that to enabling: there, [`enabled`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L87) is deliberately set to `-1`
-*before* any text is touched, specifically so no reader can mistake
-in-progress patching for "off" (point 3 of [](#enabling-static-key-enable-static-branch-enable){.secref}). Disabling has no matching
-problem to solve. During the window between the `cmpxchg` above and
-`jump_label_update()` finishing, `enabled` already reads `0` while some
-sites out there are still physically holding their "enabled" instruction —
-the opposite kind of staleness from enabling (stale "on" instead of stale
-"off"), but just as harmless. A reader who calls
-[`static_key_enabled()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L407) during that window is simply told "off" a
-few instructions before the code itself has caught up; [](#reading-the-state-without-taking-the-branch){.secref} already covers
-why these state reads only ever need to be eventually correct, never
-instruction-exact.
+Unlike enablement, deactivation does not require a transient state like `-1`. During the window between the count update and the completion of `jump_label_update()`, the enablement count reads as `0` while some call sites still execute the active code path. This brief period of stale state is harmless. A concurrent reader invoking [`static_key_enabled()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L407) receives a "disabled" response shortly before the physical instructions catch up. The design ensures that state reads are eventually consistent, rather than instruction-synchronous ([](#reading-the-state-without-taking-the-branch){.secref}).
 
-The refcounted side runs through a different function,
-[`__static_key_slow_dec_cpuslocked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L292), which only reaches
-`jump_label_update()` on the one decrement that actually drives the count
-to `0` ([`atomic_dec_and_test()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/atomic/atomic-instrumented.h#L1380) reports true exactly then, and only then).
-Every decrement that lands above `1` — `3 -> 2`, `2 -> 1`, and so on — is
-intercepted earlier, by
-[`static_key_dec_not_one()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L253), which performs a plain atomic decrement
-and returns without ever taking the jump-label lock or looking at an
-instruction stream. That is the same "every transition that isn't on a
-patch-triggering boundary is a bare atomic op" rule we discussed earlier,
-now seen from the decrement side:
+The reference-counted API deactivates keys through [`__static_key_slow_dec_cpuslocked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L292), which triggers `jump_label_update()` only when a decrement reduces the enablement count to `0`. Increments and decrements above `1` (such as transitioning from `2` to `1`) are intercepted by [`static_key_dec_not_one()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L253). This helper decrements the value atomically and returns immediately without acquiring the global mutex or scanning call sites:
 
 ```c
 static bool static_key_dec_not_one(struct static_key *key)
@@ -1457,39 +1277,20 @@ static bool static_key_dec_not_one(struct static_key *key)
 }
 ```
 
-The CAS loop is what makes this safe against concurrent decrements: if
-another CPU wins the race and changes [`key->enabled`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L87) between the read of
-this CPU and its `cmpxchg`, `v` is refreshed and the loop just re-checks the
-same two conditions against the new value rather than clobbering it.
+This compare-and-swap loop prevents race conditions between concurrent decrements. If another CPU modifies `key->enabled` between the initial read and the compare-and-swap attempt of the current CPU, the loop refreshes the local value and re-evaluates the boundary conditions.
 
 ### Deferred / rate-limited dec {#deferred-rate-limited-dec}
 
-This is the internal counterpart to the rate-limited disable in [](#rate-limited-disable-userspace-facing-knobs){.secref}, seen
-here from the function-by-function angle of this section rather than the
-call-site angle of the cookbook. [](#rate-limited-disable-userspace-facing-knobs){.secref} already covers *why* a delayed decrement exists and
-how the coalescing works when toggles arrive faster than the timeout; this
-is only the piece that was left out there — where the state-machine logic
-actually lives.
+The kernel provides a rate-limited deactivation interface to handle rapid toggle requests without incurring continuous patching overhead ([](#rate-limited-disable-userspace-facing-knobs){.secref}). While the cookbook focuses on the high-level API, this section examines the internal state-machine logic that schedules and coalesces the deferred work.
 
-[`__static_key_slow_dec_deferred()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L346) opens with the exact same
-[`static_key_dec_not_one()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L253) check [](#disabling){.secref} just introduced: if this decrement
-would not bring the count down to the `1 -> 0` boundary, it is a plain
-atomic decrement and the function returns immediately, no different from
-the non-deferred path.
+The function [`__static_key_slow_dec_deferred()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L346) begins by invoking the same helper [`static_key_dec_not_one()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L253) used in the immediate deactivation path ([](#disabling){.secref}). If this check reveals that the decrement will not reduce the enablement count to the `1 -> 0` boundary, the function performs a standard atomic decrement and exits immediately.
 
-The two paths only diverge on the one decrement that
-*would* disable the key. Where the [`__static_key_slow_dec_cpuslocked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L292) from [](#disabling){.secref}
-reaches straight for [`jump_label_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L886) at that point, this function
-instead calls [`schedule_delayed_work()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/workqueue.h#L853) — a standard kernel workqueue
-primitive that runs a callback once a given delay has elapsed, rather than
-right away — and returns without touching a single instruction. The count
-is deliberately left at `1` rather than dropped to `0`; only the *plan* to
-disable has been recorded, in the timer. In full:
+The deferred path diverges only when the decrement would reduce the count to `0` and disable the key. Instead of executing an immediate code patch via [`__static_key_slow_dec_cpuslocked()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L292), this function schedules a delayed work item and returns without modifying instructions. The enablement count remains at `1` to represent the active state, while the plan to disable is registered with the system timer:
 
 ```c
 void __static_key_slow_dec_deferred(struct static_key *key,
-				    struct delayed_work *work,
-				    unsigned long timeout)
+                                    struct delayed_work *work,
+                                    unsigned long timeout)
 {
         if (static_key_dec_not_one(key))
                 return;
@@ -1498,22 +1299,11 @@ void __static_key_slow_dec_deferred(struct static_key *key,
 }
 ```
 
-When that timer eventually fires,
-[`jump_label_update_timeout()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L325) runs the ordinary, undeferred decrement
-path from [](#disabling){.secref}. If nothing else touched the key in the meantime, the count
-is still exactly `1`, the decrement finally lands on the `1 -> 0` boundary,
-and `jump_label_update()` runs for real. If instead another caller
-incremented the key again while the timer was pending, the count is no
-longer `1` by the time the timer fires — so
-`static_key_dec_not_one()` intercepts *that* decrement too, as an ordinary
-atomic op, and `jump_label_update()` is never reached. Nothing needed
-patching back, because nothing was ever patched in the first place.
+When the timer expires, the kernel executes the work callback [`jump_label_update_timeout()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L325), which invokes the standard deactivation path. If no other execution path has modified the key, the enablement count remains at `1`, the decrement transitions the state to `0`, and the kernel patches the instructions. If another caller increments the key during the delay window, the count increases beyond `1`. When the timer expires, the deactivation helper intercepts the decrement as a non-boundary atomic operation, leaving the key enabled and bypassing the code-patching step entirely. This mechanism prevents unnecessary write passes when a key is quickly re-enabled.
 
 ### [`jump_label_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L886) → [`__jump_label_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L503) {#jump-label-update-jump-label-update}
 
-Every path in [](#enabling-static-key-enable-static-branch-enable){.secref} through [](#deferred-rate-limited-dec){.secref} eventually funnels into this function — it
-is the one that actually walks the sites of a key and asks the architecture
-layer to patch each one. Reading the outer function first:
+All enablement and deactivation paths eventually funnel into a single internal interface to execute the physical instruction patching. The entry function walks the registered call sites and delegates the architecture-specific patching work to the lower layers. The entry function reads as follows:
 
 ```c
 static void jump_label_update(struct static_key *key)
@@ -1529,18 +1319,9 @@ static void jump_label_update(struct static_key *key)
 }
 ```
 
-The first branch is the module case from [](#struct-static-key){.secref}: if bit 1 of [`key->type`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L96) is
-set ([`LINKED`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L196)), the sites of this key are not one contiguous run inside
-[`__jump_table`](https://elixir.bootlin.com/linux/v7.2/source/scripts/module.lds.S#L31), but scattered across a linked list of per-module entry
-tables ([`struct static_key_mod`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L613)), so a separate helper has to walk that
-list instead of a flat array — [](#modules-the-trickiest-part){.secref} covers [`__jump_label_mod_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L665) in
-full. Otherwise, [`static_key_entries(key)`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L409) recovers the pointer [](#boot-jump-label-init){.secref} stored
-during boot — the first entry of the contiguous run for this key inside the
-sorted, vmlinux-only table — and the real patching happens in
-`__jump_label_update()`.
+The first conditional branch handles keys referenced by dynamically loaded kernel modules. If the type field of the key includes the [`JUMP_TYPE_LINKED`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L196) tag, the call sites do not reside in a single contiguous block. Instead, they are distributed across a linked list of per-module tracking tables ([`struct static_key_mod`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L613)). A separate helper, [`__jump_label_mod_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L665), traverses this linked list to patch the instructions, as detailed in [](#modules-the-trickiest-part){.secref}. If the key is not linked to module structures, the function retrieves the start entry of the built-in contiguous run using [`static_key_entries()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L409) and delegates the core patching loop to `__jump_label_update()`.
 
-On x86, which defines [`HAVE_JUMP_LABEL_BATCH`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L5), that function looks
-like this:
+On x86 architectures defining [`HAVE_JUMP_LABEL_BATCH`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L5), this loop leverages batching to minimize instruction cache invalidation costs:
 
 ```c
 for (; entry < stop && jump_entry_key(entry) == key; entry++) {
@@ -1554,28 +1335,11 @@ for (; entry < stop && jump_entry_key(entry) == key; entry++) {
 arch_jump_label_transform_apply();
 ```
 
-The loop condition — advance while `entry < stop` *and*
-[`jump_entry_key(entry)`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L127) `== key` — only works because of the sort from [](#boot-jump-label-init){.secref}: every
-site belonging to this key is guaranteed to sit in one unbroken run
-starting at `entry`, so the loop can walk forward blindly and stop the
-instant it reaches a site belonging to some other key, with no need to
-search the rest of the table.
+The loop condition advances the iterator while the entry address is within the table boundaries and [`jump_entry_key(entry)`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L127) matches the targeted key. This contiguous scan relies on the sorting performed during early boot ([](#boot-jump-label-init){.secref}). Because all entries referencing a given key reside in an unbroken range, the loop walks forward sequentially and terminates immediately upon encountering an entry associated with a different key, avoiding unnecessary table scans.
 
-For each site still in range,
-[`jump_label_type(entry)`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L455) computes `enabled ^ branch` — the exact
-static/dynamic formula from the table in [](#two-polarities-key-default-branch-hint){.secref}, but now evaluated against the
-*current* live state of the key rather than its compile-time initial value — to
-decide whether this specific site should end up holding a
-[`JUMP_LABEL_NOP`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L186) or a [`JUMP_LABEL_JMP`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L187).
+For each entry in range, [`jump_label_type(entry)`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L455) calculates the boolean expression `enabled ^ branch` using the live state of the key to determine whether the site must hold a [`JUMP_LABEL_NOP`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L186) or a [`JUMP_LABEL_JMP`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L187) instruction.
 
-Before acting on that answer, [`jump_label_can_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L465) filters out two
-kinds of site that must not be touched at all: one still living in `__init`
-text after boot has finished (that memory may already have been freed,
-which is exactly what the [`jump_entry_is_init`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L158) flag from [](#boot-jump-label-init){.secref} was recorded to
-detect), and one that [`kernel_text_address()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/extable.c#L94) does not even recognize as live
-kernel text — built-in code that is `__exit`-only and therefore can never
-run, so patching it would be pointless even though it is technically still
-present:
+Before queuing a modification, the helper [`jump_label_can_update()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/jump_label.c#L465) filters out sites that cannot be safely modified. Specifically, it bypasses any site situated in `__init` text if initialization has already finished, as the underlying memory may have been reclaimed. It also filters out sites where the code address is not recognized as live kernel text by [`kernel_text_address()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/extable.c#L94), which typically occurs for built-in code residing in `__exit` sections that can never be executed:
 
 ```c
 static bool jump_label_can_update(struct jump_entry *entry, bool init)
@@ -1594,27 +1358,10 @@ static bool jump_label_can_update(struct jump_entry *entry, bool init)
 }
 ```
 
-Rather than patching each surviving site immediately, one at a time, the
-loop splits the work into two separate jobs:
-[`arch_jump_label_transform_queue()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/jump_label.c#L123) builds up a batch, and
-[`arch_jump_label_transform_apply()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/jump_label.c#L143) executes it. Splitting them apart is
-what lets every site belonging to one key ride through a single
-INT3-synchronized patch round ([](#batching-api-used-by-jump-labels){.secref}) instead of paying for one round per
-site.
+Instead of patching each site immediately, the loop divides the work into a queue-and-apply sequence:
 
-**Queuing a site.** Each call to `arch_jump_label_transform_queue()`
-computes the replacement bytes for that one site and hands `(address, new bytes, length)` to
-[`smp_text_poke_batch_add()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L3202). That function appends the request to
-a pending array; nothing is written to memory yet. The one exception is
-early boot: only one CPU is running, so there is no concurrent fetcher to synchronize against
-and nothing worth batching — the function calls the non-batching
-[`arch_jump_label_transform()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/jump_label.c#L117) directly instead.
-
-**Applying the batch.** `arch_jump_label_transform_apply()`
-executes everything queued so far. It calls
-[`smp_text_poke_batch_finish()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2941) which runs the three-step INT3 dance once for the whole batch instead
-of once per site. `__jump_label_update()`
-calls it once, after its loop ends, to flush whatever is still pending.
+- **Queueing modifications.** The loop invokes [`arch_jump_label_transform_queue()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/jump_label.c#L123) to compute the replacement bytes for each site and append the request to the batch via [`smp_text_poke_batch_add()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L3202). No changes are written to active memory during this step. If early boot is in progress, only a single CPU is active, eliminating the need to synchronize against concurrent instruction fetchers. Under these conditions, the loop bypasses batching and calls the immediate, non-batching helper [`arch_jump_label_transform()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/jump_label.c#L117) directly.
+- **Applying the batch.** The function [`arch_jump_label_transform_apply()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/jump_label.c#L143) flushes the queued modifications to memory. It invokes [`smp_text_poke_batch_finish()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2941), which executes a single INT3-synchronized patch round across the entire batch ([](#batching-api-used-by-jump-labels){.secref}) rather than paying the synchronization penalty for each individual site. The loop triggers an immediate flush if the queue fills, and `__jump_label_update()` executes a final flush after exiting the loop to apply all remaining modifications.
 
 ---
 
