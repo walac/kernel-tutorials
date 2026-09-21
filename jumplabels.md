@@ -1,6 +1,6 @@
 # What every kernel programmer should know about Jump Labels
 
-# Introduction
+## Introduction
 
 Kernel hot paths are full of checks that almost never fire: is this
 tracepoint enabled, is this mitigation on, is this debug feature live.
