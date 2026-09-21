@@ -254,95 +254,62 @@ Before freeing the enclosing [`struct static_key_false_deferred`](https://elixir
 
 ## Hardware background (why this is hard) {#hardware-background-why-this-is-hard}
 
-The sections above treat `nop` and `jmp` as the two shapes of a site. The
-rest of this document is about emitting those bytes and swapping them while
-the kernel is running. Three hardware facts sit under that: how a core
-treats instructions and memory loads, the exact encodings, and why a live
-multi-core kernel cannot overwrite them with an ordinary write.
+Up to this point, we have treated `nop` and `jmp` instructions as abstract logical states of a static branch. The remainder of this guide explores how the kernel actually generates these instruction bytes and dynamically hot-swaps them on a running system. This transition from software-level branch hints to live runtime code patching relies on three fundamental hardware realities: the pipelined execution of instructions versus memory loads, the precise byte-level instruction encodings of the x86_64 architecture, and the concurrency hazards that prevent a multi-processor kernel from safely overwriting active instructions with ordinary memory writes.
 
 ### What a CPU actually does with instructions {#what-a-cpu-actually-does-with-instructions}
 
-A modern x86_64 core does not "read one instruction, execute it, repeat".
-Roughly:
+A modern x86_64 core decouples instruction execution from the instruction stream using a deeply pipelined, out-of-order execution engine. Rather than executing instructions in a strict, sequential lock-step, the hardware continuously processes instructions through four key stages:
 
-1. **Fetch** bytes from the instruction cache (I-cache / L1i).
-2. **Decode** those bytes into micro-ops (variable-length on x86 — an instruction
-   can be 1–15 bytes).
-3. **Execute** out of order, with a **branch predictor** guessing which way
-   conditional branches go so the pipeline stays full.
-4. Commit results in order.
+1. **Fetch**: The hardware reads raw instruction bytes from the L1 instruction cache (L1i).
+2. **Decode**: Decoders convert these variable-length instruction bytes—ranging from 1 to 15 bytes on the x86_64 architecture—into fixed-length internal micro-operations (uops).
+3. **Execute**: Execution units dispatch uops out of order to specialized execution ports. A hardware branch predictor guesses the outcomes of conditional branches to keep these pipelines fully saturated.
+4. **Retire**: The processor commits results back in-order using a reorder buffer (ROB) to preserve the programmer-visible illusion of sequential execution.
 
-Branch prediction can hide a well-predicted `if`, but not the load that
-feeds it. Out-of-order execution and branch prediction make the *branch
-itself* close to free: predict correctly often enough and there is no
-pipeline flush to pay for. The `feature_enabled` **load** that feeds the
-guess still happens on every hit, and it still claims a data-cache access
-and an execution port each time. Under cache pressure, or if some other
-CPU writes that flag and bounces its cache line, the "cheap" branch
-stops being cheap at all.
+While a highly accurate branch predictor can mask the latency of a well-predicted conditional branch, it cannot eliminate the memory load that feeds the check. Out-of-order execution makes the branch instruction itself seem virtually free, as a correct prediction avoids pipeline flushes. However, the underlying memory load that retrieves the state of the flag (such as `feature_enabled`) must execute on every single pass. This load consumes a load buffer entry, an L1 data cache (L1d) read port, and an execution port. Under heavy data-cache pressure, or if a writer on another CPU core modifies the flag, cache coherence protocols invalidate the line. This invalidation forces the line to bounce across cores, turning a trivial data-cache lookup into a high-latency memory stall that halts the instruction window.
 
-An unconditional `nop` or `jmp` has no flag to load and no condition to
-evaluate. The "off" path is empty work for the frontend — decode a `nop`,
-move on — with no cache line to bounce and nothing for the branch
-predictor to weigh in on.
+Replacing this conditional check with an unconditional `nop` or a direct `jmp` removes the memory load entirely. Because there is no condition to evaluate and no flag to read, the CPU avoids data-cache access altogether. When the static branch is disabled, the core decodes the `nop` at the frontend and discards it with minimal overhead, requiring no execution ports or load buffers. There is no cache line to bounce between cores and no state to track in the branch target buffer (BTB), leaving the execution engine free to focus on the surrounding instruction stream.
 
 ### x86 instruction encoding: JMP and NOP {#x86-instruction-encoding-jmp-and-nop}
 
-A patch can swap `nop` and `jmp` only if they occupy the same number of
-bytes. x86 is a variable-length ISA; the encodings jump labels care about:
+Replacing an instruction at runtime requires the original and replacement instructions to occupy the exact same number of bytes. Because x86 is a variable-length instruction set architecture (ISA), individual instructions vary from one to fifteen bytes in length. The specific instruction encodings manipulated by the jump label subsystem are:
 
 | Instruction | Opcode bytes | Total size | Reach |
 |---|---|---|---|
 | `INT3` (breakpoint) | `CC` | 1 byte | n/a |
-| `JMP rel8` (short) | `EB xx` | **2 bytes** | -128..+127 bytes from the end of the insn |
+| `JMP rel8` (short) | `EB xx` | **2 bytes** | -128..+127 bytes from the end of the instruction |
 | `JMP rel32` (near) | `E9 xx xx xx xx` | **5 bytes** | ±2 GiB |
 | 2-byte NOP | `66 90` | 2 bytes | — |
 | 5-byte NOP | `0f 1f 44 00 00` (`nopl 0x0(%rax,%rax,1)`) | 5 bytes | — |
 
-Constants live in [`arch/x86/include/asm/text-patching.h`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h)
-(`JMP8_INSN_*`, `JMP32_INSN_*`, `INT3_INSN_*`) and [`arch/x86/include/asm/nops.h`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/nops.h)
-([`BYTES_NOP5`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/nops.h#L60), etc.). The relative displacement is measured from the
-**byte after** the instruction:
+The corresponding opcode constants are defined in [`arch/x86/include/asm/text-patching.h`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h) (such as `JMP8_INSN_SIZE`, `JMP8_INSN_OPCODE`, `JMP32_INSN_SIZE`, `JMP32_INSN_OPCODE`, and `INT3_INSN_OPCODE`) and [`arch/x86/include/asm/nops.h`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/nops.h) (including [`BYTES_NOP5`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/nops.h#L60)).
+
+A relative jump specifies a target offset relative to the instruction pointer of the subsequent instruction. Therefore, the relative displacement is measured from the byte immediately following the jump instruction:
 
 ```
-disp = dest - (addr + insn_size)
+displacement = destination - (instruction_address + instruction_size)
 ```
 
-That is exactly what [`text_gen_insn()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L123) / [`__text_gen_insn()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L93) compute.
+The inline helpers [`text_gen_insn()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L123) and [`__text_gen_insn()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L93) compute this exact offset when formatting the instruction buffer.
 
-**Why matching size matters:** if you replace a 5-byte `nop` with a 5-byte
-`jmp`, surrounding addresses do not move. Return addresses on stacks, other
-jump targets, exception tables, ORC unwind info — none of them need updating.
-Patching is an *in-place* byte swap of equal length.
+**Why matching size matters:** Swapping a five-byte `nop` with a five-byte `jmp` preserves the exact layout of the surrounding text. Because no instruction boundaries shift, return addresses stored on the stack, relative targets of nearby branch instructions, exception table entries, and ORC unwind metadata remain fully valid and require no relocation. The patch operates as a strictly localized, in-place byte substitution.
 
 ### Why you cannot just `memcpy` over live code on SMP {#why-you-cannot-just-memcpy-over-live-code-on-smp}
 
-Patching kernel text is harder than patching an ordinary data structure
-because three things are true of it at once:
+Modifying active kernel instructions on symmetric multiprocessing systems introduces severe architectural challenges that do not exist when writing to standard data structures. These challenges stem from three distinct, concurrent properties of kernel text memory:
 
-1. It is mapped **read-only** after boot ([`STRICT_KERNEL_RWX`](https://elixir.bootlin.com/linux/v7.2/source/arch/Kconfig#L1581)), so a
-   normal store to it would simply fault — whatever mechanism does the
-   patching has to get around that on purpose, not by accident.
-2. It is being **fetched by other CPUs** concurrently — nothing pauses the
-   rest of the machine while one CPU edits a function that every core can
-   call at any moment.
-3. It may already be sitting half-decoded in the pipeline of another CPU,
-   having been fetched moments ago but not yet executed.
+1. Kernel text memory is mapped read-only after early boot under the [STRICT_KERNEL_RWX](https://elixir.bootlin.com/linux/v7.2/source/arch/Kconfig#L1581) configuration option in [arch/Kconfig](https://elixir.bootlin.com/linux/v7.2/source/arch/Kconfig#L1581). Any direct store operation triggers a page fault, requiring a dedicated mechanism to bypass the write protection.
+2. Active instructions are fetched concurrently by other execution cores. No global pause freezes the system during a modification, meaning any core can call or continue executing the target function at any instruction boundary.
+3. Stale instruction bytes might reside within the execution pipeline or instruction cache of another core, having been fetched before the modification but not yet fully decoded or executed.
 
-Point 2 is the dangerous one. Picture two CPUs, A and B, where A is patching a 5-byte instruction that B
-keeps calling in a loop. The store A makes is not one atomic operation —
-the CPU issues it as however many bus-width writes it takes to cover 5
-bytes, and each of those writes becomes visible to the rest of the system
-separately. The fetch B makes can land in the middle of that sequence,
-seeing some bytes from before the write and some from after:
+The primary danger lies in the concurrent instruction fetch described in the second point. Consider a scenario with two cores, Core A and Core B, where Core A attempts to patch a five-byte instruction while Core B executes that same instruction sequence repeatedly. A five-byte memory write is not an atomic operation on modern memory buses. The hardware executes the modification as multiple independent write cycles, each of which becomes visible to other cores at slightly different times. An instruction fetch on Core B can occur precisely in the middle of this multi-step update, reading a mixture of old and new bytes:
 
 ```
                      time --->
 
- CPU A (patcher)   [ write bytes 2-4 ]   [ write bytes 0-1 ]
+ Core A (patcher)   [ write bytes 2-4 ]   [ write bytes 0-1 ]
                                       ^
                                       |
- CPU B (fetcher)             [ fetch all 5 bytes, right here ]
+ Core B (fetcher)             [ fetch all 5 bytes, right here ]
                                       |
                                       v
                  byte-by-byte: 0=old  1=old  2=new  3=new  4=new
@@ -351,66 +318,28 @@ seeing some bytes from before the write and some from after:
                    nor the new one — garbage
 ```
 
-If CPU A writes five bytes while CPU B is mid-fetch of that same instruction,
-B can observe this **torn** mix of old and new bytes — not a valid
-instruction, and not something the decoder in B can safely execute. x86
-does *not* guarantee that a multi-byte store to a concurrently executing
-instruction is atomic from the point of view of instruction fetch.
+When Core A writes five bytes while Core B fetches the instruction, Core B can encounter a torn instruction. This mixture of old and new bytes constitutes a malformed instruction that the hardware instruction decoder cannot safely decode, triggering an invalid opcode exception or unpredictable behavior. The x86 architecture provides no guarantee that multi-byte stores to live, concurrently executing instruction areas are atomic from the perspective of an instruction fetch.
 
-A single-byte store, by contrast, *is* atomic for instruction fetch — no CPU
-can ever see it half-written, because there is no "half" of one byte. Both
-the Intel SDM and the approach the kernel takes build on exactly that fact,
-turning one unsafe multi-byte write into three safe single-step moves:
+In contrast, a single-byte store is always atomic for instruction fetch operations. A CPU core can never observe a single byte in a partially modified state, as a single byte represents the minimum unit of coherent memory access. Both the Intel Software Developer Manual and the patching implementation in the Linux kernel leverage this atomic behavior to transform an unsafe multi-byte write into three safe, sequential steps:
 
-- First make the site a single-byte `INT3` (`0xCC`). That one-byte store is
-  atomic, so every CPU either still sees the old instruction or already sees
-  the trap — never a torn mix of the two.
-- Then rewrite the remaining bytes underneath, while the `INT3` is still
-  sitting on top of them. Nothing fetches through those bytes yet, because
-  byte 0 is still the trap.
-- Then replace the `INT3` with the first byte of the final instruction,
-  again as one atomic single-byte store — this is the moment the new
-  instruction becomes live.
-- Between each of those three steps, **synchronize every CPU** (an IPI that
-  makes every core run a serializing instruction) so that no core is still
-  executing, or has stale bytes queued up in its pipeline or I-cache, from
-  before that step.
+1. Replace the first byte of the instruction site with a single-byte breakpoint instruction, `INT3` (`0xCC`). Because this single-byte write is atomic, any concurrent execution core either reads the original instruction or hits the breakpoint trap. A torn instruction state is impossible.
+2. Overwrite the remaining bytes of the instruction while the `INT3` instruction remains at the entry boundary. No concurrent execution thread can fetch or decode these modified trailing bytes, because any execution attempt immediately traps at the preceding `INT3` byte.
+3. Replace the `INT3` byte with the first byte of the newly prepared instruction using another atomic, single-byte write. This single store marks the exact transition when the new instruction becomes live and executable.
+4. Execute a global synchronization across all cores between each of these steps. This synchronization, driven by an inter-processor interrupt, forces every core to execute a serializing instruction. The serialization flushes stale instruction bytes from the pipelines and instruction caches, preventing any core from executing out-of-date instruction sequences.
 
-That protocol lives in [`smp_text_poke_batch_finish()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2941) ([](#x86-text-patching-the-gory-details){.secref}), and jump labels
-are only one of several clients that share it — ftrace, static calls,
-kprobes, and the alternatives-patching machinery all reuse this same
-three-step dance.
+This synchronization protocol is implemented in [smp_text_poke_batch_finish()](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2941) within [arch/x86/kernel/alternative.c](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2941) (detailed in [](#x86-text-patching-the-gory-details){.secref}). Jump labels represent only one client of this multi-step patching mechanism; other core subsystems, including dynamic ftrace, static calls, kprobes, and alternative patching, rely on this identical atomic replacement protocol.
 
 ### Writing read-only kernel text: [`text_poke()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2668) {#writing-read-only-kernel-text-text-poke}
 
-Modern kernels no longer patch text by clearing the WP bit in `%cr0`, writing,
-and setting it back. That old trick worked, but it was a blunt instrument:
-between the clear and the restore, every write from every CPU could land on
-write-protected memory, not just the one instruction being patched. Anything
-else that happened to run during that window could corrupt memory it was
-never supposed to touch.
-[`__text_poke()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2546)
-replaces it with a narrower idea. Instead of unlocking the *existing* mapping
-of `.text`, it builds a **second, private virtual mapping of the exact same
-physical page** and writes through that instead.
+Modern kernels no longer patch instruction text by clearing the write-protection (WP) bit in the `%cr0` control register, performing the write, and immediately restoring the bit. While this technique was historically common, it represents a blunt instrument that compromises system integrity. Between the clearing of the WP bit and the restoration of the bit, any concurrent write from any CPU core could land on write-protected memory, rather than only the target instruction undergoing patching. Any execution thread running during this critical window could accidentally corrupt kernel memory that should remain read-only.
 
-Physical RAM does not
-know or care how it is mapped; the same page of memory can be reached through
-more than one virtual address at once, each with its own permissions.
-`.text` normally has exactly one mapping, visible to every CPU, always
-read-only and executable. That single mapping is what lets any core fetch
-and run it at any moment.
+To eliminate this risk, [`__text_poke()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2546) employs a highly localized approach. Instead of modifying the permissions of the existing read-only virtual mapping of the `.text` section, the kernel establishes a second, transient, and private virtual mapping that points to the exact same physical page of RAM, performing the write through this alias instead.
 
-`__text_poke()` temporarily adds a *second* mapping
-to that same physical page: writable, not executable, and visible only to the CPU
-doing the patching. That mapping is torn down within a handful of instructions.
-It is a second door into the same room. The contents of the room — the
-instruction bytes — are the same no matter which door you walk through, but
-only one of the two doors is ever locked.
+Physical RAM operates independently of virtual memory mappings. The same physical frame can be mapped simultaneously through multiple virtual addresses, each carrying distinct page permissions. The standard virtual mapping of the `.text` section, which remains visible to all CPU cores throughout the lifetime of the system, is strictly read-only and executable. This permanent mapping allows any active core to fetch and execute instructions at any moment.
 
-Reaching that second mapping takes several steps, and each one closes off
-a different way this could otherwise go wrong. All five below are pieces of
-one function, `__text_poke()`, working with these locals:
+During a patching operation, `__text_poke()` temporarily configures a second virtual mapping to the same physical page. This alias is marked writable but not executable, and is restricted solely to the specific CPU core performing the patching. Tearing down this mapping within a few instructions minimizes the exposure. This design operates like a second door into a secure room: the underlying content (the raw instruction bytes) remains identical regardless of the door used to access it, but only one of the doors is ever unlocked, and then only for the patching thread.
+
+Resolving this secondary mapping involves a sequence of safeguards implemented within the body of `__text_poke()`. The function manipulates the memory data to safely configure, switch, write, and tear down the temporary page(s):
 
 ```c
 static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t len)
@@ -425,14 +354,9 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
         ...
 ```
 
-`func` is the actual copy routine: `memcpy`-like for a real `text_poke()`
-call, `memset`-like for the `_set()` variant. `addr`/`src`/`len` are simply
-the target and payload the caller passed in.
+In this signature, `func` represents the target copy routine, resolving to a `memcpy`-like function for standard `text_poke()` calls, or a `memset`-like helper for the `_set` variant. The parameters `addr`, `src`, and `len` specify the target virtual address, the source payload, and the copy size.
 
-First, the function has to identify the physical page or pages backing the
-address being patched — usually one page, two if the write straddles a page
-boundary. It gets there via [`virt_to_page()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/page.h#L62) for core kernel text, or
-[`vmalloc_to_page()`](https://elixir.bootlin.com/linux/v7.2/source/mm/vmalloc.c#L821) for text living in a module:
+To determine the physical backing of the memory being patched, `__text_poke()` identifies the underlying physical pages. This normally requires a single page, but can require two pages if the write spans a page boundary. For core kernel text, the pages are retrieved using [`virt_to_page()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/page.h#L62); for text residing within a dynamic kernel module, the pages are resolved via [`vmalloc_to_page()`](https://elixir.bootlin.com/linux/v7.2/source/mm/vmalloc.c#L821):
 
 ```c
 if (!core_kernel_text((unsigned long)addr)) {
@@ -446,15 +370,9 @@ if (!core_kernel_text((unsigned long)addr)) {
 }
 ```
 
-Second, it points a pre-allocated page-table entry at that physical
-page, inside a dedicated, otherwise-empty address space called [`text_poke_mm`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2515)
-(allocated once, at boot, by [`poking_init()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/init.c#L819)). That entry is marked writable,
-and deliberately *not* global: it carries no [`_PAGE_GLOBAL`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/pgtable_types.h#L59) bit.
+The next phase points a pre-allocated page-table entry at the resolved physical page within a dedicated, otherwise-empty virtual address space called [`text_poke_mm`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2515). This address space is initialized once at boot time by [`poking_init()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/init.c#L819). The temporary entry is configured as writable and explicitly lacks the [`_PAGE_GLOBAL`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/pgtable_types.h#L59) attribute.
 
-That one detail is what keeps the whole scheme cheap. A non-global mapping
-is only ever cached in the TLB of the current CPU, so tearing it down later is a
-plain, local [`flush_tlb_mm_range()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/tlb.c#L1428) — no IPI to other CPUs, because no other
-CPU ever loaded `text_poke_mm` in the first place:
+Excluding the global bit keeps the overhead of the operation minimal. Because a non-global mapping is cached only within the translation lookaside buffer (TLB) of the current CPU core, dismantling the mapping requires only a local TLB invalidation via [`flush_tlb_mm_range()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/tlb.c#L1428). This avoids the expensive inter-processor interrupts (IPIs) that would otherwise be required to flush the TLBs of other cores, as no other core ever loads `text_poke_mm`:
 
 ```c
 pgprot = __pgprot(pgprot_val(PAGE_KERNEL) & ~_PAGE_GLOBAL);
@@ -470,63 +388,27 @@ if (cross_page_boundary) {
 }
 ```
 
-Third, the current CPU actually switches onto that private address space via
-[`use_temporary_mm(text_poke_mm)`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/tlb.c#L992), saving whatever `mm` it had loaded so it
-can restore it afterward. Writing `%cr3` changes what every virtual address
-on this CPU means. But the pipeline is deep and speculative: instructions
-ahead of that write may already have been fetched, decoded, or executed
-under the *old* mapping. Left alone, execution could keep running past the
-switch on stale translations, resolving a load or fetch as if the old
-address space were still current.
+To perform the write, the current CPU core switches onto the private address space by calling [`use_temporary_mm()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/tlb.c#L992), saving the active `mm` context for later restoration. Writing to the `%cr3` control register alters the active virtual-to-physical translations on this specific core. However, because modern processors employ deep, out-of-order execution pipelines, instructions situated ahead of the `%cr3` write might already be fetched, decoded, or speculatively executed under the previous page translations. If left uncoordinated, execution could proceed with stale translations, resolving memory access under the wrong mapping context.
 
-The x86 architecture closes that off by defining writes to control registers
-(`%cr0`/`%cr3`/`%cr4`/`%cr8`) as **serializing**: the CPU must retire
-everything prior, discard any speculative work in flight, and drop
-non-global TLB entries before it begins executing under the new value. That
-guarantee holds on every implementation — it is part of the ISA, not a
-performance accident. Loading `%cr3` here gets it for free: the CPU is
-certain to see the page-table entry from the previous step before it can
-fetch anything through it, with no separate synchronization needed:
+The x86 architecture mitigates this hazard by defining writes to control registers (including `%cr0`, `%cr3`, `%cr4`, and `%dr8`) as serializing instructions. The CPU core must retire all preceding instructions, discard any speculative instructions in flight, and flush non-global TLB entries before starting execution under the new register state. This serialization guarantee is an inherent property of the instruction set architecture (ISA). Consequently, loading the `%cr3` register ensures that subsequent instructions see the new page-table entry before fetching memory through it, requiring no further synchronization:
 
 ```c
 prev_mm = use_temporary_mm(text_poke_mm);
 ```
 
-The switch also has to deal with a second, unrelated hazard: hardware
-watchpoints. The debug registers that hold watchpoint addresses
-(`%dr0`–`%dr3`) are global CPU state, not scoped to whichever address space
-happens to be loaded, so a watchpoint stays armed straight through a
-page-table switch regardless of serialization.
+This context switch must also address a secondary hazard involving hardware breakpoints and watchpoints. The debug registers (`%dr0` through `%dr3`) are global processor state rather than thread-specific or address-space-scoped entities. Thus, any active watchpoints remain armed across the address-space switch, regardless of register serialization.
 
-[`text_poke_mm_addr`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2516) is deliberately placed in the low, user-range half of
-the address space (the hardware sidebar below explains why), which happens
-to be exactly where the watchpoints of a debugger live. If a userspace
-watchpoint aliased onto that address while this CPU was mid-write through
-it, the CPU would fire a debug exception in the middle of the very
-code-patching machinery the kernel itself relies on. That would misdeliver
-a signal that has nothing to
-do with whatever the debugger was actually watching for — or worse,
-interrupt the sensitive write itself.
+The target address [`text_poke_mm_addr`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2516) resides in the lower, user-range half of the address space. If a user-mode debugger has registered a watchpoint that overlaps with this numeric address, the processor would trigger a debug exception mid-write, right in the middle of the code-patching sequence. This would result in a misdelivered signal to the user process or, worse, interrupt the critical patching operation.
 
-So [`use_temporary_mm()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/tlb.c#L992)
-explicitly calls [`hw_breakpoint_disable()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/debugreg.h#L109) right after the switch, and its
-counterpart, [`hw_breakpoint_restore()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/hw_breakpoint.c#L484), restores them afterward.
-Breakpoints are disabled wholesale rather than only for the specific
-colliding address, so this even suppresses unrelated kernel breakpoints
-(e.g. ones set by perf) for that brief window. The window is short enough
-that the kernel accepts the suppression.
+To prevent this collision, `use_temporary_mm()` disables hardware breakpoints immediately after switching the address space by calling [`hw_breakpoint_disable()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/debugreg.h#L109). The counterpart function [`hw_breakpoint_restore()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/hw_breakpoint.c#L484) restores the breakpoint state after patching is complete. This temporary disablement suppresses all breakpoints globally on the current core, including kernel-space breakpoints registered by tools such as perf.
 
-Fourth, with the writable alias finally in place, the actual copy happens
-by calling `func`, at the address `text_poke_mm_addr + offset_in_page(addr)`:
+With the writable alias in place, the core executes the copy by invoking `func` at the target address offset:
 
 ```c
 func((u8 *)text_poke_mm_addr + offset_in_page(addr), src, len);
 ```
 
-For a real `text_poke()` call, `func` is
-[`text_poke_memcpy()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2528) — the small wrapper the caller handed in as the `func`
-argument (the `_set()` variant passes the memset-flavored
-[`text_poke_memset()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2535) instead):
+For standard `text_poke()` invocations, `func` corresponds to [`text_poke_memcpy()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2528), which wraps the inline copy with architectural overrides (the `_set` variant instead passes [`text_poke_memset()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2535)):
 
 ```c
 static void text_poke_memcpy(void *dst, const void *src, size_t len)
@@ -537,21 +419,11 @@ static void text_poke_memcpy(void *dst, const void *src, size_t len)
 }
 ```
 
-That sequence raises two questions: why the write needs `STAC`/`CLAC` around it at all, and why the copy
-inside them has to be inline rather than a real call to [`memcpy()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/lib/memcpy_64.S#L43).
-The hardware sidebar below answers both together.
+This design addresses strict architectural checks on user-range accesses and build-time verification rules, which dictate the use of inlined memory operations.
 
-Fifth, the temporary mapping is dismantled in the reverse
-order it was built: [`pte_clear()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/pgtable.h#L88) removes the page-table entry,
-[`unuse_temporary_mm()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/tlb.c#L1027) switches `%cr3` back to the saved `mm` (serializing
-again, for the same reason as the switch in step three), and
-`flush_tlb_mm_range()` drops the now-stale local TLB entry.
+The transient mapping is dismantled in the reverse order of its creation. Calling [`pte_clear()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/pgtable.h#L88) deletes the page-table entries, while [`unuse_temporary_mm()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/tlb.c#L1027) switches `%cr3` back to the original address space (enforcing another CPU serialization). The local TLB entry is then invalidated using `flush_tlb_mm_range()`.
 
-Finally, for a real `text_poke()` call (though not for the [`_set`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2744)/[`_copy`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L2727)
-variants, which skip this) the function reads back what it just wrote and
-`memcmp`s it against what was intended. Any mismatch is a [`BUG()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/bug.h#L114): a
-silent failure here would leave the CPU executing bytes the patcher did
-not mean to write.
+For standard `text_poke()` operations, the kernel validates the patch by reading back the modified bytes and performing a comparison against the source buffer. Any discrepancy triggers a [`BUG()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/bug.h#L114) panic, preventing the processor from executing corrupt or unintended instructions:
 
 ```c
 pte_clear(text_poke_mm, text_poke_mm_addr, ptep);
@@ -568,8 +440,7 @@ if (func == text_poke_memcpy)
 local_irq_restore(flags);
 ```
 
-Put together, this is one physical page reached through two different
-virtual addresses with two different permissions:
+Put together, this is one physical page reached through two different virtual addresses with two different permissions:
 
 ```
                           physical page (the actual RAM
@@ -582,85 +453,28 @@ virtual addresses with two different permissions:
                      |               \      /            |
                      v                \    /             v
           .text  [ RO, executable ]    \  /    [ RW, not executable ]
-          (every CPU's %cr3 maps        \/     (only this CPU's %cr3
-           this address, forever)                maps this address,
-                                                  only while patching)
+          (the %cr3 of each CPU         \/     (only the %cr3 of this CPU
+           maps this address,                    maps this address,
+           forever)                               only while patching)
 ```
 
-Every CPU, all the time, can execute the left-hand mapping — that one never
-changes permission or address. Only the *current* CPU, and only *during*
-`__text_poke()`, can additionally reach the exact same bytes through the
-right-hand mapping, and only to write them. Once the teardown step above
-clears that PTE and flushes the local TLB, the right-hand mapping is gone
-again; the left-hand one is all that is left, now showing the new bytes.
+The permanent mapping of `.text` remains read-only across all CPU cores. Only the active patching core gains transient, local access to the writable alias, and this access is restricted to the duration of `__text_poke()`. Once the page-table entry is cleared and the local TLB is flushed, the writable alias is completely removed, leaving only the updated read-only `.text` mapping. The entire text poking process is serialized by [`text_mutex`](https://elixir.bootlin.com/linux/v7.2/source/kernel/extable.c#L27), ensuring that concurrent threads never race to establish competing temporary mappings.
 
-So the *permanent* kernel mapping of `.text` stays read-only everywhere, all
-the time; only a throwaway, single-CPU-visible alias is ever writable, and it
-exists for only a handful of instructions. All of this is serialized by
-[`text_mutex`](https://elixir.bootlin.com/linux/v7.2/source/kernel/extable.c#L27), so two concurrent patchers never race to build competing
-temporary mappings.
-
-> **Hardware sidebar — why `STAC`/`CLAC`, and why the copy must be inline.**
-> Some CPU features exist specifically to catch the kernel touching low,
-> user-range addresses by *accident*. The classic bug — and attack surface —
-> is a corrupted or attacker-influenced pointer that the kernel ends up
-> dereferencing as if it pointed to trusted kernel memory. `STAC`/`CLAC` are
-> how the kernel tells the CPU, in effect, "the access I'm about to make into
-> that range is deliberate, stand down for a moment." Two independent
-> features watch for exactly this, and they don't watch for the same thing:
-> 
-> - **SMAP** ("Supervisor Mode Access Prevention") faults if kernel code
->   accesses a page whose page-table entry has [`_PAGE_USER`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/pgtable_types.h#L53) set — that
->   is, a page actually mapped user-accessible. It looks only at that one
->   permission bit, never at the numeric address.
-> - **LASS** ("Linear Address Space Separation"), newer than SMAP, faults on
->   *any* kernel access to an address below the canonical-address midpoint.
->   That means anywhere numerically in the user range, regardless of whether
->   `_PAGE_USER` is set on that particular page.
-> 
-> `text_poke_mm_addr` falls right in the gap between those two rules. It is
-> **not** a userspace mapping: `poking_init()` sets it
-> to [`TASK_UNMAPPED_BASE`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/processor.h#L684), plus a KASLR-style random offset — the same
-> range where calls to [`mmap()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/sys_x86_64.c#L82) made by an ordinary process would land —
-> because `text_poke_mm` is built with [`mm_alloc()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/fork.c#L1166), the ordinary allocator for a
-> process address space, and a freshly allocated `mm` has empty space there.
-> The page-table entry actually built at that address is an ordinary kernel-only mapping,
-> with `_PAGE_USER` left clear, so nothing about it is reachable
-> from user mode.
-> 
-> That distinction is exactly what splits the two checks apart. SMAP only
-> ever looks at the `_PAGE_USER` bit, and that bit is clear here, so SMAP has
-> nothing to object to. LASS blocks by address alone, regardless of the bit —
-> and this address, purely by where it numerically sits, is exactly what
-> LASS would fault on.
-> 
-> That is why the actual code calls [`lass_stac()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/smap.h#L70)/[`lass_clac()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/smap.h#L65) rather
-> than plain `STAC`/`CLAC`. They emit the same underlying instructions, just
-> gated on [`X86_FEATURE_LASS`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/cpufeatures.h#L317) instead of [`X86_FEATURE_SMAP`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/cpufeatures.h#L253) — so the call
-> compiles down to a no-op on CPUs without LASS, and to a real access-check
-> override on CPUs that have it. Either way it works, whether the CPU has
-> SMAP, LASS, both, or neither. Conceptually this is the same `AC`-bit
-> mechanism the kernel already uses whenever it deliberately touches real
-> userspace memory ([`copy_from_user()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/uaccess.h#L218) and friends); text poking just happens
-> to need it too, for a kernel-internal mapping that only *looks* like a
-> userspace address.
-> 
-> Opening that window has one more consequence. objtool ([](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref} covers it
-> in depth) enforces a build-time rule that no `call` instruction may appear
-> between a `STAC` and the next `CLAC`. The reason is concrete: `AC` is
-> ordinary CPU state, but unlike registers, it is not saved and restored
-> across a context switch. A call is a black box — it might transitively
-> reach [`schedule()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/sched/core.c#L7316) and put the task to sleep, and if that happens while
-> `AC` is set, the override can leak into whichever task runs next, or fail
-> to be restored when this one resumes.
-> 
-> That rule is why the copy can never be a real call to
-> `memcpy()`. On x86_64, `memcpy()` is hand-written assembly living in a
-> separate object, reachable only through a genuine `call` instruction.
-> [`__inline_memcpy()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/string.h#L11)/[`__inline_memset()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/string.h#L21) sidestep that problem: forced inline,
-> they compile to the same `rep movsb`/`rep stosb` sequence the real
-> functions would use, but leave no `call` for objtool to flag, because
-> there is no separate function left to call.
+> **Hardware details — why SMAP, LASS, and inline copying dictate the implementation.**
+> Modern processors implement security mechanisms designed to prevent the kernel from accessing user-range virtual addresses by accident. These features guard against kernel vulnerabilities where a corrupted or attacker-controlled pointer is dereferenced within supervisor mode. Two hardware-level protections enforce these boundaries using distinct criteria:
+>
+> - **SMAP** ("Supervisor Mode Access Prevention") generates a page fault if kernel code attempts to access a virtual page whose page-table entry has the [`_PAGE_USER`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/pgtable_types.h#L53) bit set. This mechanism evaluates only the user permission bit of the translation entry, ignoring the numeric value of the virtual address.
+> - **LASS** ("Linear Address Space Separation") blocks supervisor-mode accesses to any virtual address falling under the user address space. This protection relies entirely on the numeric range of the address, regardless of whether `_PAGE_USER` is configured on the page.
+>
+> The address `text_poke_mm_addr` is allocated within the lower half of the virtual address space, corresponding to the range where user processes receive mappings from [`mmap()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/sys_x86_64.c#L82). The virtual address is allocated via [`mm_alloc()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/fork.c#L1166) at boot, which initializes the structure at [`TASK_UNMAPPED_BASE`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/processor.h#L684) with a randomized offset. However, because the page-table entry built for this mapping has the `_PAGE_USER` bit cleared, the page is not user-accessible.
+>
+> This configuration interacts differently with each protection mechanism. Because the `_PAGE_USER` bit remains clear, SMAP does not flag the access. However, because the virtual address numerically resides in the user-space range, LASS would trigger an immediate supervisor-mode page fault.
+>
+> To bypass this restriction, the kernel invokes [`lass_stac()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/smap.h#L70) and [`lass_clac()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/smap.h#L65) around the copy. These functions check for the presence of [`X86_FEATURE_LASS`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/cpufeatures.h#L317) on the processor; if enabled, they temporarily toggle the alignment check (AC) flag in the `%rflags` register, instructing the hardware to permit the access. On processors supporting only [`X86_FEATURE_SMAP`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/cpufeatures.h#L253), or neither feature, these operations resolve to no-ops or default behavior. This is conceptually identical to the user-access window established by [`copy_from_user()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/uaccess.h#L218).
+>
+> Enabling the AC override imposes a critical constraint on the code. The kernel build-time analysis tool, objtool, enforces a strict rule prohibiting any instruction calling another function between a STAC and a CLAC instruction. The AC flag is an active CPU register state but is not automatically saved or restored during a task context switch. If the code inside the override window executes a function call that eventually yields the CPU via [`schedule()`](https://elixir.bootlin.com/linux/v7.2/source/kernel/sched/core.c#L7316), the AC flag remains set. This would leak the user-access permission into the next scheduled task, compromising system security.
+>
+> This build-time rule is the reason the patching copy cannot utilize the standard library implementation of `memcpy()`. On x86_64, `memcpy()` is an assembly routine defined in a separate object file, necessitating a function call. To adhere to the objtool constraint, the patching sequence employs [`__inline_memcpy()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/string.h#L11) and [`__inline_memset()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/string.h#L21), which compile directly into inline `rep movsb` and `rep stosb` assembly instructions. This removes the function call entirely, satisfying the safety validation of objtool.
 
 ---
 
