@@ -963,13 +963,9 @@ This linker-driven aggregation is confined to the static `vmlinux` binary. A ker
 
 ## Size of the patchable site on x86 (runtime) {#size-of-the-patchable-site-on-x86-runtime}
 
-[](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref} showed that a nop-default site can end up being *either* 2 or 5 bytes,
-decided by the assembler at build time based on the real distance to
-`l_yes`. Nothing in [`struct jump_entry`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L111) ([](#struct-jump-entry-relative-form){.secref}) records which one it ended
-up as — there is no size field anywhere in it. So months or years later,
-when this key is actually toggled on a running system, the code doing the
-patching has to *rediscover* that size from scratch, by looking at the
-live bytes currently sitting in `.text`:
+At runtime, the instruction-patching subsystem on x86 must dynamically determine the size of each patchable site before performing any modification. Build-time optimizations discussed in [](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref} allow the assembler to emit either a 2-byte or a 5-byte instruction at a jump site, depending on the relative displacement to the target. However, [struct jump_entry](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L111) (detailed in [](#struct-jump-entry-relative-form){.secref}) contains no field or metadata recording the length of the instruction that the assembler selected. When the kernel modifies a jump label on a running system, the patching engine must rediscover the instruction length by parsing the live machine bytes currently sitting in the executable memory.
+
+The kernel delegates this discovery to [arch_jump_entry_size()](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/jump_label.c#L20):
 
 ```c
 /* arch/x86/kernel/jump_label.c */
@@ -983,33 +979,11 @@ int arch_jump_entry_size(struct jump_entry *entry)
 }
 ```
 
-[`insn_decode_kernel()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/insn.h#L172) is the general-purpose x86 instruction decoder of
-the kernel (the same kind of code that also has to understand arbitrary
-instructions for kprobes), pointed here at the address that [`jump_entry_code(entry)`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L117)
-from [](#the-jump-table-entry-sidecar-metadata){.secref} already knows how to recover. It does not just
-count bytes: it genuinely parses the instruction at that address (opcode,
-prefixes, displacement, all of it) and reports how many bytes it occupies,
-via `insn.length`. Whatever is sitting there right now — the original
-compiler-emitted `nop` or `jmp` from [](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref}, or a previously-patched
-replacement from an earlier toggle — this call decodes it and returns its
-true size.
+The retrieval of the target address relies on [jump_entry_code()](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L117) (explained in [](#the-jump-table-entry-sidecar-metadata){.secref}). The x86 instruction decoder of the kernel, [insn_decode_kernel()](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/insn.h#L172), parses the machine code at that location into [struct insn](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/insn.h#L68). Rather than performing a simple byte count, the decoder fully parses the opcode, prefixes, and displacement to determine the exact boundary of the instruction, reporting the result in the `length` field of the structure. Whether the memory location contains the compiler-generated default `nop`, a branch instruction, or a previously patched instruction from an earlier state transition, the decoder resolves the true instruction boundaries.
 
-`BUG_ON(insn.length != 2 && insn.length != 5)` is a sanity
-check, not a normal error path: if this ever decodes to any width other
-than the two shapes [](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref} established, something has gone badly wrong (the
-table and the text it describes have desynchronized), and there is no safe
-way to keep patching.
+A sanity check via the [BUG_ON()](https://elixir.bootlin.com/linux/v7.2/source/include/asm-generic/bug.h#L81) macro, evaluating `BUG_ON(insn.length != 2 && insn.length != 5)`, guards against corruption. If the decoder encounters any length other than these two supported sizes, the metadata table has desynchronized from the executable stream, making further patching unsafe.
 
-This decode-on-demand step is specific to x86. Other architectures — arm64,
-for instance, which defines a fixed [`JUMP_LABEL_NOP_SIZE`](https://elixir.bootlin.com/linux/v7.2/source/arch/arm64/include/asm/jump_label.h#L17) — never need
-it, because every patchable site on those architectures is always the same
-width, known in advance, with nothing to discover. x86 is the odd one out
-precisely because the size optimization from [](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref} means the width of a site is
-a fact about *that specific call site*, not a constant true of the whole kernel.
-The architecture-independent [`jump_entry_size()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L171) reflects that split: it
-returns the fixed `JUMP_LABEL_NOP_SIZE` where an architecture defines one,
-and only falls back to calling [`arch_jump_entry_size()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/jump_label.c#L20) — the decoder
-above — when no such constant exists:
+This dynamic decoding step is unique to the x86 architecture. Architectures with fixed instruction sizes, such as arm64, define a constant [JUMP_LABEL_NOP_SIZE](https://elixir.bootlin.com/linux/v7.2/source/arch/arm64/include/asm/jump_label.h#L17). On those platforms, every patchable site shares a uniform, known width, which eliminates the need for runtime discovery. The generic, architecture-independent [jump_entry_size()](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L171) helper encapsulates this architectural difference:
 
 ```c
 static inline int jump_entry_size(struct jump_entry *entry)
@@ -1022,10 +996,9 @@ static inline int jump_entry_size(struct jump_entry *entry)
 }
 ```
 
-Once the size is known, [`__jump_label_patch()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/jump_label.c#L36) builds the two byte
-sequences this site could possibly need — the `jmp` form *and* the `nop`
-form, regardless of which one is about to be installed — and picks between
-them:
+If the architecture defines a global constant size, the compiler resolves `jump_entry_size()` to that constant. Otherwise, the helper falls back to the dynamic decoder.
+
+After resolving the instruction size, the helper [__jump_label_patch()](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/jump_label.c#L36) prepares both candidate byte sequences (the jump instruction and the corresponding no-op sequence) before selecting the sequence to install:
 
 ```c
 size = arch_jump_entry_size(entry);
@@ -1041,36 +1014,13 @@ case JMP32_INSN_SIZE:  /* 5 */
 }
 ```
 
-[`JMP8_INSN_OPCODE`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L60) (`0xEB`) and [`JMP32_INSN_OPCODE`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L57) (`0xE9`) are the same
-two jump encodings named in the `rel8`/`rel32` explanation from [](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref}, just given
-their real opcode values here. [`text_gen_insn()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L123) builds the actual `jmp`
-bytes for whichever opcode it is given, computing the displacement itself as
-`dest - (addr + size)` — precisely the "distance from the address of the
-*next* instruction" convention [](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref} described for `rel8`/`rel32` encodings,
-just computed here at patch time instead of by the assembler at build time.
-[`x86_nops`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L91) is a small lookup table of ready-made no-op byte sequences, one
-per length, so [`x86_nops[size]`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L91) hands back a correctly-sized `nop` without
-having to construct one on the fly — the same 2-byte and 5-byte encodings
-already named in [](#assembly-level-picture){.secref}.
+The constants [JMP8_INSN_SIZE](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L59), [JMP8_INSN_OPCODE](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L60), [JMP32_INSN_SIZE](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L56), and [JMP32_INSN_OPCODE](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L57) represent the underlying instruction lengths and raw opcodes (`0xEB` and `0xE9`) for short and near jumps on x86. The utility [text_gen_insn()](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/text-patching.h#L123) synthesizes the target jump sequence, calculating the self-relative offset as `dest - (addr + size)`. This calculation mirrors the standard x86 instruction pointer offset convention, resolved here during execution rather than at compile time.
 
-Building both `code` and `nop` up front, rather than only the one being
-installed, is what makes the next safety check possible. Before writing
-anything, `__jump_label_patch()` decides which of the two it *expects* to
-find already sitting at this address — and, importantly, that expectation
-is the *opposite* of what it is about to install: if `type` says "install a
-`jmp`," the live bytes had better currently be the old `nop` (that is the
-only state a nop-default site should be transitioning *from*); if `type`
-says "install a `nop`," the live bytes had better currently be the old
-`jmp`.
+To obtain the corresponding no-op sequence, the function indexes into the lookup table [x86_nops](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/kernel/alternative.c#L91) using the decoded size. This lookup supplies a pre-calculated `nop` sequence matching the exact width of the site without requiring instruction generation at runtime.
 
-A [`memcmp()`](https://elixir.bootlin.com/linux/v7.2/source/lib/string.c#L655) of the real bytes against that expectation runs before
-any write. If they don't match, the jump-table metadata and the actual
-instruction stream have diverged somehow — corruption, a bug elsewhere in
-the kernel, or a race this code did not anticipate — and there is no safe
-way to proceed: it logs the mismatch via [`pr_crit`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/printk.h#L543) and calls
-[`BUG()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/bug.h#L114), deliberately crashing rather than patching blind and risking
-that the CPU ends up executing whatever garbage caused the mismatch in the
-first place.
+Generating both candidate sequences beforehand allows the kernel to perform a pre-patching safety validation. Before modifying the instruction stream, the patching engine determines the instruction sequence expected to reside in memory at the destination. This expected sequence is the logical inverse of the target sequence being installed. If the update request specifies [JUMP_LABEL_JMP](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L185), the memory location must currently hold the no-op sequence. Conversely, if the update request specifies [JUMP_LABEL_NOP](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L185), the memory location must hold the active jump instruction.
+
+The patching engine invokes [memcmp()](https://elixir.bootlin.com/linux/v7.2/source/lib/string.c#L655) to compare the live instructions in memory against this expected sequence. A mismatch indicates that the metadata table and the instruction stream have diverged somehow, suggesting memory corruption, a race condition, or an unhandled synchronization failure. In this scenario, proceeding is unsafe. The kernel reports the divergence using [pr_crit()](https://elixir.bootlin.com/linux/v7.2/source/include/linux/printk.h#L543) and immediately calls [BUG()](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/bug.h#L114), halting the processor to prevent the execution of arbitrary or corrupted instructions.
 
 ---
 
