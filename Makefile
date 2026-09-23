@@ -12,6 +12,7 @@ BLOG_DIR  ?= $(HOME)/work/walac.github.io
 POST_DATE ?= $(shell date +%Y-%m-%d)
 
 AUTHOR := Wander Lairson Costa
+LANG   := en-US
 TITLE   = $$(sed -n '1s/^\# *//p' $<)
 
 %.pdf: %.md $(FILTERS) $(TEX_DEPS)
@@ -35,7 +36,8 @@ TITLE   = $$(sed -n '1s/^\# *//p' $<)
 		-V urlcolor=NavyBlue \
 		-V citecolor=NavyBlue \
 		--metadata title="$(TITLE)" \
-		--metadata author="$(AUTHOR)"
+		--metadata author="$(AUTHOR)" \
+		--metadata lang="$(LANG)"
 
 %.odt: %.md $(FILTERS) reference.odt
 	sed '1d' $< | pandoc -o $@ \
@@ -45,7 +47,8 @@ TITLE   = $$(sed -n '1s/^\# *//p' $<)
 		--lua-filter=break-code.lua \
 		--reference-doc=reference.odt \
 		--metadata title="$(TITLE)" \
-		--metadata author="$(AUTHOR)"
+		--metadata author="$(AUTHOR)" \
+		--metadata lang="$(LANG)"
 
 %.html: %.md $(FILTERS) style.css
 	sed '1d' $< | pandoc -o $@ \
@@ -57,7 +60,8 @@ TITLE   = $$(sed -n '1s/^\# *//p' $<)
 		--lua-filter=break-code.lua \
 		--css=style.css \
 		--metadata title="$(TITLE)" \
-		--metadata author="$(AUTHOR)"
+		--metadata author="$(AUTHOR)" \
+		--metadata lang="$(LANG)"
 
 %.txt: %.md $(FILTERS)
 	{ printf '%s\n\n%s\n\n' "$(TITLE)" "$(AUTHOR)"; \
@@ -65,7 +69,10 @@ TITLE   = $$(sed -n '1s/^\# *//p' $<)
 		--toc --toc-depth=3 \
 		--lua-filter=secnum.lua \
 		--lua-filter=break-code.lua \
-		--to=plain; \
+		--to=plain \
+		--metadata title="$(TITLE)" \
+		--metadata author="$(AUTHOR)" \
+		--metadata lang="$(LANG)"; \
 	} > $@
 
 %.jkl.md: %.md $(FILTERS)
@@ -76,7 +83,10 @@ TITLE   = $$(sed -n '1s/^\# *//p' $<)
 		'---' '' '* TOC' '{:toc}' ''; \
 	  sed '1d' $< | pandoc \
 		--lua-filter=secnum.lua \
-		-t gfm+attributes; \
+		-t gfm+attributes \
+		--metadata title="$(TITLE)" \
+		--metadata author="$(AUTHOR)" \
+		--metadata lang="$(LANG)"; \
 	} > $@
 
 install: $(JEKYLL)
