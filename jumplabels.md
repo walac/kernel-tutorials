@@ -528,12 +528,10 @@ static enum jump_label_type jump_label_type(struct jump_entry *entry)
 
 The high-level macros [`static_branch_likely()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L474) and [`static_branch_unlikely()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L486) do not generate or manipulate instruction bytes directly. Instead, they delegate to two architecture-specific helper functions:
 
-- [`arch_static_branch()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L35) operates as the **nop-by-default** helper. The generated patch site initially contains a standard `nop` instruction. (As detailed in the optimization mechanism of [](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref}, the compiler may emit a `jmp` that `objtool` rewrites into a same-sized `nop` before boot).
+- [`arch_static_branch()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L35) operates as the **nop-by-default** helper. The generated patch site initially contains a standard `nop` instruction. (As detailed in the optimization mechanism of [](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref}, the compiler may emit a `jmp` that `objtool` rewrites into a same-sized `nop`).
 - [`arch_static_branch_jump()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L45) operates as the **jmp-by-default** helper. It places a concrete branch jump instruction at the call site when the object file is generated.
 
 Both helpers communicate the path that execution took through the patched instruction. A `nop` instruction falls through to the next sequential instruction, causing the helper to return `false`. A `jmp` instruction transfers execution out-of-line, causing the helper to return `true`. The implementation details of the underlying `asm goto` statement are examined in [](#the-two-asm-helpers){.secref}.
-
-The Boolean return value reflects the active instruction shape at the patch site. The logical association with the branch path of the caller is resolved through the negation logic implemented in the macro definitions.
 
 The four possible combinations of key type and call-site hint map onto these two low-level helpers. The helper selection is determined by the compile-time type of the static key, while the optional negation of the return value is dictated by the direction hint:
 
@@ -588,10 +586,6 @@ l_yes:
 }
 ```
 
-The use of two separate inline functions, rather than a single function parameterized with a branch selection flag—such as a speculative `arch_static_branch(key, branch, use_jmp)`—is dictated by compile-time constraints. Because the assembly payload is evaluated during compilation, a runtime argument cannot dynamically alter the instruction bytes embedded within the function body. The compiled instructions are finalized when the translation unit is processed.
-
-Consequently, separate functions encapsulate each instruction layout, with the logical branch path selected by the macros described in [](#how-the-macros-pick-the-asm){.secref}. This selection is resolved statically based on the compile-time type of the static key.
-
 The function bodies rely on inline assembly, specifically the GCC `asm goto` extension. The functional components of the `asm goto` blocks provide several key mechanisms:
 
 - **`asm goto(template : : inputs : : goto-labels)`** — This extension to inline assembly allows control flow to branch from the assembly block directly to a C label. Unlike a standard inline assembly block, which falls through to the subsequent C statement, `asm goto` registers a list of destination C labels. Falling off the end of the instruction template acts as a logical fall-through, executing `return false;`. Jumping to the designated assembly label transfers control directly to the C block marked by `l_yes`, executing `return true;`. This mechanism allows the compiler to treat the assembly block as a standard conditional branch.
@@ -611,7 +605,9 @@ jmp %l[l_yes]
 
 - `1:` establishes the local label pointing to the start of the branch instruction, satisfying the `code` field requirement described in [](#the-jump-table-entry-sidecar-metadata){.secref}.
 - `jmp %l[l_yes]` represents an unconditional branch jump to the target address associated with the C label `l_yes`. This forms the pre-patched compiled branch.
-- `JUMP_TABLE_ENTRY` (`\"%c0 + %c1\"`, `\"%l[l_yes]\")` expands inline, embedding the metadata record for the call site. The directives `.pushsection __jump_table, \"aw\"` and `.popsection` temporarily redirect the assembler output to the custom [`__jump_table`](https://elixir.bootlin.com/linux/v7.2/source/scripts/module.lds.S#L31) section, separating the metadata from the executable `.text` segment.
+- `JUMP_TABLE_ENTRY` (`\"%c0 + %c1\"`, `\"%l[l_yes]\")` expands inline, embedding the metadata record for the call site.
+
+The operand declaration `: : \"i\" (key), \"i\" (branch) : : l_yes);` binds the C variables to the assembly template. Defining the inputs with the `"i"` constraint forces the compiler to resolve these parameters as compile-time constants. This constraint ensures that the metadata values remain static and available during the assembly phase, even after the compiler has inline-expanded the containing functions. The clobber list is empty, and the goto-label list specifies the branch target `l_yes`.
 
 The companion function `arch_static_branch()` is constructed analogously, but delegates the generation of the local label and instruction to the [`ARCH_STATIC_BRANCH_ASM`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L26) macro:
 
@@ -632,8 +628,6 @@ This preprocessor conditional is resolved at build time based on [`HAVE_JUMP_LAB
 - **With the hack enabled** — The instruction layout matches `arch_static_branch_jump()` but appends a descriptive comment for readability. The expression `" + 2"` performs assembler-level arithmetic on the key address, setting bit 1 as a metadata flag for `objtool`. This flag indicates that the site should be processed during build-time optimization, as detailed in [](#have-jump-label-hack-why-sites-are-2-or-5-bytes){.secref} and [](#assembly-level-picture){.secref}.
 - **With the hack disabled** — The instruction line is generated using raw bytes: `1: .byte 0x0f,0x1f,0x44,0x00,0x00`. The preprocessor converts the macro [`BYTES_NOP5`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/nops.h#L60) into a comma-separated byte list. This sequence decodes as a valid 5-byte `nop` instruction (`nopl 0x0(%rax,%rax,1)`), providing a safe, inactive default path.
 
-The operand declaration `: : \"i\" (key), \"i\" (branch) : : l_yes);` binds the C variables to the assembly template. Defining the inputs with the `"i"` constraint forces the compiler to resolve these parameters as compile-time constants. This constraint ensures that the metadata values remain static and available during the assembly phase, even after the compiler has inline-expanded the containing functions. The clobber list is empty, and the goto-label list specifies the branch target `l_yes`.
-
 ### The jump table entry (sidecar metadata) {#the-jump-table-entry-sidecar-metadata}
 
 Along with the inline instruction, each branch site emits a metadata descriptor of type [`struct jump_entry`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L111) into the [`__jump_table`](https://elixir.bootlin.com/linux/v7.2/source/scripts/module.lds.S#L31) section. The [`JUMP_TABLE_ENTRY`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L15) macro generates this metadata without outputting any executable CPU instructions:
@@ -649,6 +643,9 @@ Along with the inline instruction, each branch site emits a metadata descriptor 
         ".popsection \n\t"
 ```
 
+> *The directives `.pushsection __jump_table, \"aw\"` and `.popsection` temporarily redirect the assembler output to the custom [`__jump_table`](https://elixir.bootlin.com/linux/v7.2/source/scripts/module.lds.S#L31) section, separating the metadata from the executable `.text` segment.*
+
+
 | Field | Asm | Meaning |
 |---|---|---|
 | `code` | `.long 1b - .` | relative offset to the patchable insn |
@@ -657,13 +654,13 @@ Along with the inline instruction, each branch site emits a metadata descriptor 
 
 Every directive in this macro instructs the assembler to format data rather than producing executable machine instructions. Each directive is evaluated by the assembler according to specific rules:
 
-- **`.pushsection __jump_table, "aw"`** — This switches the active assembly target section to the designated jump table. The flag string `"aw"` configures the properties of the section: `a` designates the section as allocatable (loading it into memory at boot alongside code and data), while `w` marks it as writable. Setting the writable property is critical because the page tables of the CPU enforce write permissions at runtime. This configuration enables the patching engine to modify the section contents post-boot.
-- **`_ASM_ALIGN`** — This aligns the subsequent data, expanding to `.balign 8` on x86_64 and `.balign 4` on 32-bit platforms. This alignment ensures that the native-width pointer-sized fields are aligned to natural boundaries, preventing unaligned memory accesses.
-- **[`ANNOTATE_DATA_SPECIAL`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/annotate.h#L112)** — This assembler macro emits metadata to a build-time section analyzed exclusively by the `objtool` verification engine. It signals that the succeeding bytes represent static data rather than executable instructions. This prevents `objtool` from attempting to parse the offsets as machine code.
-- **`.long 1b - .`** — This directive reserves 4 bytes of data initialized to the value of the relative expression `1b - .`. The operand `1b` resolves to the address of the nearest preceding local label `1:` (representing the patchable branch site), while the `.` symbol resolves to the address of the directive itself. The assembler computes this subtraction at build time, producing a signed relative distance in bytes.
-- **`.long " label " - ."`** — This repeats the relative distance calculation for the target label, which corresponds to the address of the target C label `l_yes`. This offset represents the relative distance from the metadata field to the branch target.
-- **`_ASM_PTR " " key " - ."`** — This reserves a pointer-sized field, expanding to `.quad` (8 bytes) on x86_64. The symbol `key` resolves to the expression `"%c0 + %c1"`. At assembly time, the expression computes the relative offset from the metadata field to the address of the corresponding static key. The addition of the branch hint (`%c1`) effectively ORs the logical branch bit into bit 0 of the stored key address, which is retrieved at runtime by [`jump_entry_is_branch()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L153).
-- **`.popsection`** — This directive terminates the active section redirect, restoring the assembly target back to the original section (typically `.text`).
+- **`.pushsection __jump_table, "aw"`**: This switches the active assembly target section to the designated jump table. The flag string `"aw"` configures the properties of the section: `a` designates the section as allocatable (loading it into memory at boot alongside code and data), while `w` marks it as writable. Setting the writable property is critical because the page tables of the CPU enforce write permissions at runtime. This configuration enables the patching engine to modify the section contents post-boot.
+- **[`_ASM_ALIGN`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/asm.h#L37)**: This aligns the subsequent data, expanding to `.balign 8` on x86_64 and `.balign 4` on 32-bit platforms. This alignment ensures that the native-width pointer-sized fields are aligned to natural boundaries, preventing unaligned memory accesses.
+- **[`ANNOTATE_DATA_SPECIAL`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/annotate.h#L112)**: This assembler macro emits metadata to a build-time section analyzed exclusively by the `objtool` verification engine. It signals that the succeeding bytes represent static data rather than executable instructions. This prevents `objtool` from attempting to parse the offsets as machine code.
+- **`.long 1b - .`**: This directive reserves 4 bytes of data initialized to the value of the relative expression `1b - .`. The operand `1b` resolves to the address of the nearest preceding local label `1:` (representing the patchable branch site), while the `.` symbol resolves to the address of the directive itself. The assembler computes this subtraction at build time, producing a signed relative distance in bytes.
+- **`.long label  - .`**: This repeats the relative distance calculation for the target label, which corresponds to the address of the target C label `l_yes`. This offset represents the relative distance from the metadata field to the branch target.
+- **[`_ASM_PTR`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/asm.h#L36) ` key  - .`**: This reserves a pointer-sized field, expanding to `.quad` (8 bytes) on x86_64. The symbol `key` resolves to the expression `"%c0 + %c1"`. At assembly time, the expression computes the relative offset from the metadata field to the address of the corresponding static key. The addition of the branch hint (`%c1`) effectively ORs the logical branch bit into bit 0 of the stored key address, which is retrieved at runtime by [`jump_entry_is_branch()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L153).
+- **`.popsection`**: This directive terminates the active section redirect, restoring the assembly target back to the original section (typically `.text`).
 
 The fields `code` and `target` utilize 32-bit displacements via `.long`, whereas `key` requires the full pointer width of `_ASM_PTR`. Because the patchable instruction and the target block reside within the same function body, a 32-bit offset is guaranteed to reach the target. Conversely, the target [`struct static_key`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L86) may be located far from the call site under KASLR or within a separate kernel module, requiring a full-width relocation.
 
