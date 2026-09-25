@@ -491,7 +491,7 @@ The compiler must emit a concrete, valid machine instruction at every call site 
 
 When the default state of the key aligns with the call-site direction hint, the compiler emits a `nop` instruction. When the default state and the direction hint mismatch, the compiler emits a `jmp` instruction. Disaligning these variables in relation to the expected steady state of the static key—the hazard described in [](#choosing-true-vs-false-and-likely-vs-unlikely){.secref}—causes the hot path to start with a branch jump, which persists until an explicit toggle occurs at runtime.
 
-The reference documentation at the top of [`include/linux/jump_label.h`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L31) maps out this structural matrix:
+The reference documentation at the top of [`include/linux/jump_label.h`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h) maps out this structural matrix:
 
 ```
                 likely()                    unlikely()
@@ -716,7 +716,7 @@ Consequently, when the patching engine toggles a site at runtime—for example, 
 
 In configurations where the optimization hack is disabled (such as older toolchains lacking `objtool` integration), the compiler bypasses this pipeline. It compiles the `#else` branch of the assembly template, emitting a fixed 5-byte NOP via `.byte BYTES_NOP5` regardless of target proximity. Later runtime patching always replaces this NOP with a 5-byte jump instruction. While functional, this fallback increases the instruction footprint by 3 bytes per nop-default call site compared to optimized builds.
 
-The build-time optimization only applies to nop-default branches generated via the `arch_static_branch()` helper. The jmp-default helper, [`arch_static_branch_jump()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L45), generates its `asm goto` directly, passing the key expression to [`JUMP_TABLE_ENTRY`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L15) as a plain `\"%c0 + %c1\"` without the additional offset of `2`.
+The build-time optimization only applies to nop-default branches generated via the `arch_static_branch()` helper. The jmp-default helper, [`arch_static_branch_jump()`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L45), generates its `asm goto` directly, passing the key expression to [`JUMP_TABLE_ENTRY`](https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/jump_label.h#L15) as a plain `%c0 + %c1` without the additional offset of `2`.
 
 Without this metadata flag, `objtool` does not modify the jump instruction, which reaches boot as a real conditional jump that is patched only when the key state is disabled. This instruction is still compiled using either the 2-byte `rel8` or 5-byte `rel32` layout depending on assembler-level distance calculation. The optimization hack alters whether `objtool` transforms the instruction post-compilation, rather than how the initial jump instruction is encoded by the assembler.
 
@@ -731,7 +731,7 @@ Bit 1 of the key field—the metadata segment masked off by [`jump_entry_key()`]
                                          (marks the site as init-only text)
 ```
 
-The boot-time flag is initialized using `jump_entry_set_init()` during the execution of `jump_label_init()`, and is subsequently read using [`jump_entry_is_init()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L158). This dual usage is a common source of confusion when analyzing the initialization sequence.
+The boot-time flag is initialized using `jump_entry_set_init()` during the execution of `jump_label_init()`, and is subsequently read using [`jump_entry_is_init()`](https://elixir.bootlin.com/linux/v7.2/source/include/linux/jump_label.h#L158). This dual usage is a common source of confusion when analyzing the initialization sequence. The section [](#boot-jump-label-init){.secref} covers the initialization in detail.
 
 ### Assembly-level picture {#assembly-level-picture}
 
@@ -744,7 +744,7 @@ The integration of the C helper functions, the sidecar jump-table metadata, and 
                             ; at build time)
 
 __jump_table:                   ; non-executable metadata
-        .long   1b - .          ; code:   self-relative offset to the NOP instruction
+        .long   1b - .          ; code: self-relative offset to the NOP instruction
         .long   L - .           ; target: self-relative offset to l_yes
         .quad   key+branch+2 - .; key: static_key address, branch bit 0,
                                 ;      plus the objtool-only "+2" signal
